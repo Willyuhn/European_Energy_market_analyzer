@@ -1,4 +1,4 @@
-# ⚡ European Energy Market Dashboard
+# European Energy Market Dashboard
 
 A web application for visualizing solar capture prices, negative price hours, and market price analytics across European electricity bidding zones.
 
