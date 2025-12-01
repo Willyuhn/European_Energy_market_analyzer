@@ -78,16 +78,12 @@ Capture Price = Σ(Generation × Price) / Σ(Generation)
 ```
 
 ### Capture Price (Floor 0)
-Same as capture price, but negative prices are treated as €0 - representing revenue with a price floor protection.
+Same as capture price, but negative prices are treated as €0 - representing actual revenues with a price floor protection.
 
 ### Solar at Negative Prices (%)
 Percentage of total solar generation that occurred during negative price hours.
 
-## License
-
-MIT License
-
 ## Author
 
-Built with ☀️ for European energy market analysis
+Marian Willuhn
 
