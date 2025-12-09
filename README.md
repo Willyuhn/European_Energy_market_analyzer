@@ -1,89 +1,106 @@
 # European Energy Market Dashboard
 
-A web application for visualizing solar capture prices, negative price hours, and market price analytics across European electricity bidding zones.
+A real-time dashboard visualizing European electricity market data, focusing on solar capture prices and negative price hours across 47 bidding zones.
 
-![Python](https://img.shields.io/badge/Python-3.8+-blue.svg)
-![FastAPI](https://img.shields.io/badge/FastAPI-0.109-green.svg)
-![DuckDB](https://img.shields.io/badge/DuckDB-0.10-yellow.svg)
+![Dashboard Preview](https://img.shields.io/badge/Status-Live-brightgreen)
 
 ## Features
 
-- **Negative Price Hours**: Track cumulative hours with negative electricity prices per bidding zone
-- **Average Market Price**: Day-ahead wholesale electricity prices (€/MWh)
-- **Solar Capture Price**: Revenue-weighted price received by solar generators
-- **Capture Price (Floor 0)**: Capture price with negative prices floored to zero
-- **Solar at Negative Prices**: Percentage of solar generation during negative price periods
+- **6 Key Metrics** per bidding zone:
+  - Negative Price Hours
+  - Average Market Price (€/MWh)
+  - Solar Capture Price (€/MWh)
+  - Capture Price with Floor at €0
+  - Capture Rate (%)
+  - Solar Volume at Negative Prices (%)
 
-### Interactive Controls
+- **Interactive Filtering**:
+  - 47 European bidding zones
+  - Monthly and yearly views
+  - Daily granularity when selecting single zone + month
 
-- **47 European Bidding Zones**: Including Germany-Luxembourg, Nordic zones, Italian zones, and more
-- **Monthly & Daily Granularity**: View data by month or drill down to daily values
-- **Dynamic Charts**: All metrics visualized as interactive bar charts
+- **Instant Loading**: Pre-computed summary tables for fast performance
 
 ## Data Source
 
-Data sourced from [ENTSO-E Transparency Platform](https://transparency.entsoe.eu/):
-- `EnergyPrices_12.1.D` - Day-ahead electricity prices
-- `AggregatedGenerationPerType_16.1.B_C` - Generation by production type (Solar)
-
-## Installation
-
-1. Clone the repository:
-```bash
-git clone https://github.com/YOUR_USERNAME/european-energy-dashboard.git
-cd european-energy-dashboard
-```
-
-2. Install dependencies:
-```bash
-pip install -r requirements.txt
-```
-
-3. Add your ENTSO-E data files:
-   - Place CSV files in the project root directory
-   - Naming format: `2025_XX_EnergyPrices_12.1.D_r3.csv` and `2025_XX_AggregatedGenerationPerType_16.1.B_C.csv`
-
-4. Run the application:
-```bash
-python app.py
-```
-
-5. Open your browser at [http://localhost:8000](http://localhost:8000)
+[ENTSO-E Transparency Platform](https://transparency.entsoe.eu/)
+- Day-ahead energy prices (12.1.D)
+- Aggregated generation per type (16.1.B&C)
 
 ## Tech Stack
 
-- **Backend**: FastAPI + Uvicorn
-- **Database**: DuckDB (in-memory SQL analytics)
-- **Frontend**: Vanilla JS + Chart.js
-- **Styling**: Custom CSS with JetBrains Mono & Sora fonts
+- **Backend**: FastAPI + Python
+- **Database**: Google Cloud SQL (MySQL)
+- **Frontend**: Chart.js
+- **Deployment**: Google Cloud Run
 
-## API Endpoints
+## Local Development
 
-| Endpoint | Description |
-|----------|-------------|
-| `GET /` | Main dashboard HTML |
-| `GET /api/data` | Monthly aggregated market data |
-| `GET /api/daily-data` | Daily granular market data |
-| `GET /api/countries` | List of available bidding zones |
+```bash
+# Install dependencies
+pip install -r requirements.txt
 
-## Metrics Explained
+# Set environment variables (required!)
+export DB_HOST="your-cloud-sql-ip"
+export DB_PORT="3306"
+export DB_USER="your-username"
+export DB_PASSWORD="your-password"
+export DB_NAME="energy_market"
 
-### Negative Price Hours
-Sum of hours where the day-ahead electricity price was below €0/MWh. For 15-minute resolution markets, each negative interval counts as 0.25 hours.
+# Or copy env.example and source it
+cp env.example .env
+# Edit .env with your values
+source .env
 
-### Capture Price
-The generation-weighted average price received by solar generators:
+# Run the app
+python app.py
 ```
-Capture Price = Σ(Generation × Price) / Σ(Generation)
+
+Open http://localhost:8080
+
+## Project Structure
+
+```
+├── app.py                      # Main FastAPI application
+├── requirements.txt            # Python dependencies
+├── Dockerfile                  # Cloud Run deployment
+├── scripts/
+│   ├── create_summary_tables.py    # Create pre-computed summary tables
+│   ├── calculate_daily_capture.py  # Calculate daily capture metrics
+│   └── upload_generation_new.py    # Upload generation data to Cloud SQL
+└── README.md
 ```
 
-### Capture Price (Floor 0)
-Same as capture price, but negative prices are treated as €0 - representing actual revenues with a price floor protection.
+## Database Schema
 
-### Solar at Negative Prices (%)
-Percentage of total solar generation that occurred during negative price hours.
+### Summary Tables (pre-computed for fast queries)
 
-## Author
+- `summary_total` - Overall totals across all zones/year
+- `summary_yearly` - Aggregated per country, full year
+- `summary_monthly` - Per country, per month
+- `summary_daily` - Per country, per month, per day
 
-Marian Willuhn
+### Raw Data Tables
 
+- `energy_prices` - Day-ahead electricity prices
+- `generation_per_type` - Solar/Wind generation data
+
+## Deployment to Cloud Run
+
+1. Build and push Docker image:
+```bash
+gcloud builds submit --tag gcr.io/PROJECT_ID/energy-dashboard
+```
+
+2. Deploy to Cloud Run:
+```bash
+gcloud run deploy energy-dashboard \
+  --image gcr.io/PROJECT_ID/energy-dashboard \
+  --platform managed \
+  --region europe-west1 \
+  --set-env-vars DB_HOST=xxx,DB_USER=xxx,DB_PASSWORD=xxx,DB_NAME=energy_market
+```
+
+## License
+
+MIT

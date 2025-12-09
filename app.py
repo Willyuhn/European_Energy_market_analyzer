@@ -1,848 +1,302 @@
 """
 European Energy Market Dashboard
-Visualizes negative price hours, capture prices, avg market prices, 
-and capture prices with floor at 0 for each bidding zone and month.
+Full featured with capture prices and summary tables
 """
 
+import os
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
-from fastapi.staticfiles import StaticFiles
-import duckdb
-import json
-from pathlib import Path
+import mysql.connector
 
 app = FastAPI(title="European Energy Market Dashboard")
 
-# Get the directory where the CSV files are located
-DATA_DIR = Path(__file__).parent
+# Database configuration (set via environment variables)
+DB_HOST = os.environ['DB_HOST']
+DB_PORT = int(os.getenv('DB_PORT', '3306'))
+DB_USER = os.environ['DB_USER']
+DB_PASSWORD = os.environ['DB_PASSWORD']
+DB_NAME = os.getenv('DB_NAME', 'energy_market')
 
 
-def format_country_name(name: str) -> str:
-    """
-    Transform area display names to more readable country/zone names.
-    """
-    # Direct replacements
-    name_map = {
-        "DE-LU": "Germany-Luxembourg",
-        "DK1": "Denmark West (DK1)",
-        "DK2": "Denmark East (DK2)",
-        "NO1": "Norway South-East (NO1)",
-        "NO2": "Norway South-West (NO2)",
-        "NO2NSL": "Norway NSL (NO2NSL)",
-        "NO3": "Norway Central (NO3)",
-        "NO4": "Norway North (NO4)",
-        "NO5": "Norway West (NO5)",
-        "SE1": "Sweden North (SE1)",
-        "SE2": "Sweden Central-North (SE2)",
-        "SE3": "Sweden Central-South (SE3)",
-        "SE4": "Sweden South (SE4)",
-        "IE(SEM)": "Ireland (SEM)",
-        "UA-IPS": "Ukraine (IPS)",
+def get_db_connection():
+    return mysql.connector.connect(
+        host=DB_HOST, port=DB_PORT, user=DB_USER, password=DB_PASSWORD,
+        database=DB_NAME, use_pure=True, connection_timeout=30
+    )
+
+
+@app.get("/health")
+def health_check():
+    """Health check for Cloud Run"""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT 1")
+        cursor.fetchone()
+        cursor.close()
+        conn.close()
+        return {"status": "healthy", "database": "connected"}
+    except Exception as e:
+        return {"status": "unhealthy", "error": str(e)}
+
+
+@app.get("/api/summary/total")
+def get_summary_total():
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT total_neg_hours, avg_market_price, capture_price, 
+               capture_price_floor0, capture_rate, solar_at_neg_price_pct 
+        FROM summary_total WHERE id = 1
+    """)
+    row = cursor.fetchone()
+    cursor.close()
+    conn.close()
+    
+    return {
+        "neg_hours": float(row[0] or 0),
+        "avg_market_price": float(row[1] or 0),
+        "capture_price": float(row[2] or 0),
+        "capture_price_floor0": float(row[3] or 0),
+        "capture_rate": float(row[4] or 0),
+        "solar_at_neg_price_pct": float(row[5] or 0)
     }
-    
-    # Check for direct mapping
-    if name in name_map:
-        return name_map[name]
-    
-    # Replace IT- prefix with Italy-
-    if name.startswith("IT-"):
-        return "Italy-" + name[3:]
-    
-    return name
 
 
-def get_market_data():
-    """
-    Run the comprehensive SQL query to calculate all energy market metrics
-    per bidding zone and month.
-    """
-    conn = duckdb.connect(":memory:")
-    
-    query = f"""
-    WITH raw AS (
-        SELECT
-            *,
-            CAST(SUBSTR(filename, LENGTH('{DATA_DIR}/') + 6, 2) AS INTEGER) AS month,
-            COUNT(*) FILTER (
-                WHERE ResolutionCode = 'PT15M'
-            ) OVER (
-                PARTITION BY AreaDisplayName, "DateTime(UTC)"
-            ) AS cnt_15m_same_ts
-        FROM read_csv_auto(
-            '{DATA_DIR}/2025_??_EnergyPrices_12.1.D_r3.csv', 
-            filename=true
-        )
-        WHERE 
-            ContractType = 'Day-ahead'
-            AND Sequence NOT IN ('2', '3')
-    ),
-    
-    -- Negative hours aggregation
-    neg_hours_agg AS (
-        SELECT
-            AreaDisplayName AS country,
-            month,
-            SUM(
-                CASE
-                    WHEN ResolutionCode = 'PT15M' AND "Price[Currency/MWh]" < 0 THEN 0.25
-                    WHEN ResolutionCode = 'PT60M' AND cnt_15m_same_ts = 0 AND "Price[Currency/MWh]" < 0 THEN 1
-                    ELSE 0
-                END
-            ) AS neg_hours
-        FROM raw
-        GROUP BY AreaDisplayName, month
-    ),
-    
-    -- Average market price per country/month
-    avg_price_agg AS (
-        SELECT
-            AreaDisplayName AS country,
-            month,
-            AVG("Price[Currency/MWh]") AS avg_price
-        FROM raw
-        WHERE 
-            ResolutionCode = 'PT60M' OR cnt_15m_same_ts = 0
-        GROUP BY AreaDisplayName, month
-    ),
-    
-    prices_raw AS (
-        SELECT
-            ep.*,
-            CAST(SUBSTR(ep.filename, LENGTH('{DATA_DIR}/') + 6, 2) AS INTEGER) AS month,
-            COUNT(*) FILTER (
-                WHERE ResolutionCode = 'PT60M'
-            ) OVER (
-                PARTITION BY AreaDisplayName, "DateTime(UTC)"
-            ) AS cnt_60m_same_ts
-        FROM read_csv_auto('{DATA_DIR}/2025_??_EnergyPrices_12.1.D_r3.csv', filename=true) AS ep
-        WHERE
-            ep.ContractType = 'Day-ahead'
-            AND ep.Sequence NOT IN ('2', '3')
-    ),
-    
-    prices_dedup AS (
-        SELECT *
-        FROM prices_raw
-        WHERE
-            ResolutionCode = 'PT60M'
-            OR (ResolutionCode = 'PT15M' AND cnt_60m_same_ts = 0)
-    ),
-    
-    joined AS (
-        SELECT
-            ep.AreaDisplayName AS country,
-            ep."DateTime(UTC)",
-            ep.ResolutionCode,
-            ep.month,
-            ep."Price[Currency/MWh]" AS price_raw,
-            ag."ActualGenerationOutput" AS gen_mw,
-            CASE
-                WHEN ep.ResolutionCode = 'PT15M' THEN 0.25
-                WHEN ep.ResolutionCode = 'PT60M' THEN 1.0
-                ELSE 1.0
-            END AS interval_hours
-        FROM prices_dedup AS ep
-        JOIN read_csv_auto(
-                '{DATA_DIR}/2025_??_AggregatedGenerationPerType_16.1.B_C.csv',
-                strict_mode=false,
-                ignore_errors=true,
-                filename=true
-            ) AS ag
-          ON ep.AreaCode = ag.AreaCode
-         AND ep."DateTime(UTC)" = ag."DateTime"
-         AND ep.month = CAST(SUBSTR(ag.filename, LENGTH('{DATA_DIR}/') + 6, 2) AS INTEGER)
-        WHERE
-            ag.ProductionType = 'Solar'
-            AND ag."ActualGenerationOutput" > 0
-    ),
-    
-    -- Capture price calculation per month
-    capture_price AS (
-        SELECT
-            country,
-            month,
-            ROUND(
-                SUM(gen_mw * interval_hours * price_raw)
-                / NULLIF(SUM(gen_mw * interval_hours), 0),
-                2
-            ) AS capture_price
-        FROM joined
-        GROUP BY country, month
-    ),
-    
-    -- Floor-priced capture price per month
-    capture_floor0 AS (
-        SELECT
-            country,
-            month,
-            ROUND(
-                SUM(gen_mw * interval_hours * CASE WHEN price_raw < 0 THEN 0 ELSE price_raw END)
-                / NULLIF(SUM(gen_mw * interval_hours), 0),
-                2
-            ) AS capture_price_floor0
-        FROM joined
-        GROUP BY country, month
-    ),
-    
-    -- Solar volume share at negative prices (%)
-    solar_neg_share AS (
-        SELECT
-            country,
-            month,
-            ROUND(
-                100.0 * SUM(CASE WHEN price_raw < 0 THEN gen_mw * interval_hours ELSE 0 END)
-                / NULLIF(SUM(gen_mw * interval_hours), 0),
-                2
-            ) AS solar_at_neg_price_pct
-        FROM joined
-        GROUP BY country, month
-    )
-    
-    SELECT
-        COALESCE(nh.country, ap.country, cp.country, cf.country, sn.country) AS country,
-        COALESCE(nh.month, ap.month, cp.month, cf.month, sn.month) AS month,
-        COALESCE(nh.neg_hours, 0) AS neg_hours,
-        ROUND(COALESCE(ap.avg_price, 0), 2) AS avg_market_price,
-        COALESCE(cp.capture_price, 0) AS capture_price,
-        COALESCE(cf.capture_price_floor0, 0) AS capture_price_floor0,
-        COALESCE(sn.solar_at_neg_price_pct, 0) AS solar_at_neg_price_pct
-    FROM neg_hours_agg nh
-    FULL OUTER JOIN avg_price_agg ap ON nh.country = ap.country AND nh.month = ap.month
-    FULL OUTER JOIN capture_price cp ON COALESCE(nh.country, ap.country) = cp.country 
-                                     AND COALESCE(nh.month, ap.month) = cp.month
-    FULL OUTER JOIN capture_floor0 cf ON COALESCE(nh.country, ap.country, cp.country) = cf.country 
-                                      AND COALESCE(nh.month, ap.month, cp.month) = cf.month
-    FULL OUTER JOIN solar_neg_share sn ON COALESCE(nh.country, ap.country, cp.country, cf.country) = sn.country 
-                                       AND COALESCE(nh.month, ap.month, cp.month, cf.month) = sn.month
-    WHERE COALESCE(nh.country, ap.country, cp.country, cf.country, sn.country) IS NOT NULL
-    ORDER BY country, month;
-    """
-    
-    result = conn.execute(query).fetchall()
-    columns = ['country', 'month', 'neg_hours', 'avg_market_price', 'capture_price', 'capture_price_floor0', 'solar_at_neg_price_pct']
-    
-    data = []
-    for row in result:
-        record = dict(zip(columns, row))
-        record['country'] = format_country_name(record['country'])
-        data.append(record)
-    
+@app.get("/api/summary/yearly")
+def get_summary_yearly():
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT country, total_neg_hours, avg_market_price, capture_price,
+               capture_price_floor0, capture_rate, solar_at_neg_price_pct
+        FROM summary_yearly ORDER BY country
+    """)
+    results = cursor.fetchall()
+    cursor.close()
     conn.close()
     
-    return data
-
-
-def get_countries_list():
-    """Get list of unique countries/bidding zones."""
-    conn = duckdb.connect(":memory:")
-    query = f"""
-    SELECT DISTINCT AreaDisplayName 
-    FROM read_csv_auto('{DATA_DIR}/2025_01_EnergyPrices_12.1.D_r3.csv')
-    WHERE ContractType = 'Day-ahead'
-    ORDER BY AreaDisplayName
-    """
-    result = conn.execute(query).fetchall()
-    conn.close()
-    # Apply name formatting and sort alphabetically
-    formatted_names = sorted([format_country_name(row[0]) for row in result])
-    return formatted_names
-
-
-def get_daily_data():
-    """
-    Run the comprehensive SQL query to calculate all energy market metrics
-    per bidding zone and day.
-    """
-    conn = duckdb.connect(":memory:")
-    
-    query = f"""
-    WITH raw AS (
-        SELECT
-            *,
-            CAST(SUBSTR(filename, LENGTH('{DATA_DIR}/') + 6, 2) AS INTEGER) AS month,
-            CAST("DateTime(UTC)" AS DATE) AS day_date,
-            COUNT(*) FILTER (
-                WHERE ResolutionCode = 'PT15M'
-            ) OVER (
-                PARTITION BY AreaDisplayName, "DateTime(UTC)"
-            ) AS cnt_15m_same_ts
-        FROM read_csv_auto(
-            '{DATA_DIR}/2025_??_EnergyPrices_12.1.D_r3.csv', 
-            filename=true
-        )
-        WHERE 
-            ContractType = 'Day-ahead'
-            AND Sequence NOT IN ('2', '3')
-    ),
-    
-    -- Negative hours aggregation per day
-    neg_hours_agg AS (
-        SELECT
-            AreaDisplayName AS country,
-            month,
-            day_date,
-            SUM(
-                CASE
-                    WHEN ResolutionCode = 'PT15M' AND "Price[Currency/MWh]" < 0 THEN 0.25
-                    WHEN ResolutionCode = 'PT60M' AND cnt_15m_same_ts = 0 AND "Price[Currency/MWh]" < 0 THEN 1
-                    ELSE 0
-                END
-            ) AS neg_hours
-        FROM raw
-        GROUP BY AreaDisplayName, month, day_date
-    ),
-    
-    -- Average market price per country/day
-    avg_price_agg AS (
-        SELECT
-            AreaDisplayName AS country,
-            month,
-            day_date,
-            AVG("Price[Currency/MWh]") AS avg_price
-        FROM raw
-        WHERE 
-            ResolutionCode = 'PT60M' OR cnt_15m_same_ts = 0
-        GROUP BY AreaDisplayName, month, day_date
-    ),
-    
-    prices_raw AS (
-        SELECT
-            ep.*,
-            CAST(SUBSTR(ep.filename, LENGTH('{DATA_DIR}/') + 6, 2) AS INTEGER) AS month,
-            CAST(ep."DateTime(UTC)" AS DATE) AS day_date,
-            COUNT(*) FILTER (
-                WHERE ResolutionCode = 'PT60M'
-            ) OVER (
-                PARTITION BY AreaDisplayName, "DateTime(UTC)"
-            ) AS cnt_60m_same_ts
-        FROM read_csv_auto('{DATA_DIR}/2025_??_EnergyPrices_12.1.D_r3.csv', filename=true) AS ep
-        WHERE
-            ep.ContractType = 'Day-ahead'
-            AND ep.Sequence NOT IN ('2', '3')
-    ),
-    
-    prices_dedup AS (
-        SELECT *
-        FROM prices_raw
-        WHERE
-            ResolutionCode = 'PT60M'
-            OR (ResolutionCode = 'PT15M' AND cnt_60m_same_ts = 0)
-    ),
-    
-    joined AS (
-        SELECT
-            ep.AreaDisplayName AS country,
-            ep."DateTime(UTC)",
-            ep.ResolutionCode,
-            ep.month,
-            ep.day_date,
-            ep."Price[Currency/MWh]" AS price_raw,
-            ag."ActualGenerationOutput" AS gen_mw,
-            CASE
-                WHEN ep.ResolutionCode = 'PT15M' THEN 0.25
-                WHEN ep.ResolutionCode = 'PT60M' THEN 1.0
-                ELSE 1.0
-            END AS interval_hours
-        FROM prices_dedup AS ep
-        JOIN read_csv_auto(
-                '{DATA_DIR}/2025_??_AggregatedGenerationPerType_16.1.B_C.csv',
-                strict_mode=false,
-                ignore_errors=true,
-                filename=true
-            ) AS ag
-          ON ep.AreaCode = ag.AreaCode
-         AND ep."DateTime(UTC)" = ag."DateTime"
-         AND ep.month = CAST(SUBSTR(ag.filename, LENGTH('{DATA_DIR}/') + 6, 2) AS INTEGER)
-        WHERE
-            ag.ProductionType = 'Solar'
-            AND ag."ActualGenerationOutput" > 0
-    ),
-    
-    -- Capture price calculation per day
-    capture_price AS (
-        SELECT
-            country,
-            month,
-            day_date,
-            ROUND(
-                SUM(gen_mw * interval_hours * price_raw)
-                / NULLIF(SUM(gen_mw * interval_hours), 0),
-                2
-            ) AS capture_price
-        FROM joined
-        GROUP BY country, month, day_date
-    ),
-    
-    -- Floor-priced capture price per day
-    capture_floor0 AS (
-        SELECT
-            country,
-            month,
-            day_date,
-            ROUND(
-                SUM(gen_mw * interval_hours * CASE WHEN price_raw < 0 THEN 0 ELSE price_raw END)
-                / NULLIF(SUM(gen_mw * interval_hours), 0),
-                2
-            ) AS capture_price_floor0
-        FROM joined
-        GROUP BY country, month, day_date
-    ),
-    
-    -- Solar volume share at negative prices per day
-    solar_neg_share AS (
-        SELECT
-            country,
-            month,
-            day_date,
-            ROUND(
-                100.0 * SUM(CASE WHEN price_raw < 0 THEN gen_mw * interval_hours ELSE 0 END)
-                / NULLIF(SUM(gen_mw * interval_hours), 0),
-                2
-            ) AS solar_at_neg_price_pct
-        FROM joined
-        GROUP BY country, month, day_date
-    )
-    
-    SELECT
-        COALESCE(nh.country, ap.country, cp.country, cf.country, sn.country) AS country,
-        COALESCE(nh.month, ap.month, cp.month, cf.month, sn.month) AS month,
-        COALESCE(nh.day_date, ap.day_date, cp.day_date, cf.day_date, sn.day_date) AS day_date,
-        EXTRACT(DAY FROM COALESCE(nh.day_date, ap.day_date, cp.day_date, cf.day_date, sn.day_date)) AS day,
-        COALESCE(nh.neg_hours, 0) AS neg_hours,
-        ROUND(COALESCE(ap.avg_price, 0), 2) AS avg_market_price,
-        COALESCE(cp.capture_price, 0) AS capture_price,
-        COALESCE(cf.capture_price_floor0, 0) AS capture_price_floor0,
-        COALESCE(sn.solar_at_neg_price_pct, 0) AS solar_at_neg_price_pct
-    FROM neg_hours_agg nh
-    FULL OUTER JOIN avg_price_agg ap ON nh.country = ap.country AND nh.day_date = ap.day_date
-    FULL OUTER JOIN capture_price cp ON COALESCE(nh.country, ap.country) = cp.country 
-                                     AND COALESCE(nh.day_date, ap.day_date) = cp.day_date
-    FULL OUTER JOIN capture_floor0 cf ON COALESCE(nh.country, ap.country, cp.country) = cf.country 
-                                      AND COALESCE(nh.day_date, ap.day_date, cp.day_date) = cf.day_date
-    FULL OUTER JOIN solar_neg_share sn ON COALESCE(nh.country, ap.country, cp.country, cf.country) = sn.country 
-                                       AND COALESCE(nh.day_date, ap.day_date, cp.day_date, cf.day_date) = sn.day_date
-    WHERE COALESCE(nh.country, ap.country, cp.country, cf.country, sn.country) IS NOT NULL
-    ORDER BY country, day_date;
-    """
-    
-    result = conn.execute(query).fetchall()
-    columns = ['country', 'month', 'day_date', 'day', 'neg_hours', 'avg_market_price', 'capture_price', 'capture_price_floor0', 'solar_at_neg_price_pct']
-    
-    data = []
-    for row in result:
-        record = dict(zip(columns, row))
-        record['country'] = format_country_name(record['country'])
-        # Convert date to string for JSON serialization
-        if record['day_date']:
-            record['day_date'] = str(record['day_date'])
-        data.append(record)
-    
-    conn.close()
-    
-    return data
-
-
-@app.get("/api/data")
-def api_data():
-    """API endpoint returning all market data as JSON."""
-    data = get_market_data()
+    data = [{
+        "country": r[0], "neg_hours": float(r[1] or 0), "avg_market_price": float(r[2] or 0),
+        "capture_price": float(r[3] or 0), "capture_price_floor0": float(r[4] or 0),
+        "capture_rate": float(r[5] or 0), "solar_at_neg_price_pct": float(r[6] or 0)
+    } for r in results]
     return {"data": data}
 
 
-@app.get("/api/daily-data")
-def api_daily_data():
-    """API endpoint returning daily market data as JSON."""
-    data = get_daily_data()
+@app.get("/api/summary/monthly")
+def get_summary_monthly():
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT country, month, neg_hours, avg_market_price, capture_price,
+               capture_price_floor0, capture_rate, solar_at_neg_price_pct
+        FROM summary_monthly ORDER BY country, month
+    """)
+    results = cursor.fetchall()
+    cursor.close()
+    conn.close()
+    
+    data = [{
+        "country": r[0], "month": r[1], "neg_hours": float(r[2] or 0), 
+        "avg_market_price": float(r[3] or 0), "capture_price": float(r[4] or 0),
+        "capture_price_floor0": float(r[5] or 0), "capture_rate": float(r[6] or 0),
+        "solar_at_neg_price_pct": float(r[7] or 0)
+    } for r in results]
     return {"data": data}
 
 
-@app.get("/api/countries")
-def api_countries():
-    """API endpoint returning list of countries."""
-    countries = get_countries_list()
-    return {"countries": countries}
+@app.get("/api/summary/daily")
+def get_summary_daily(country: str = None, month: int = None):
+    """Get daily summary for a specific country and month"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    if country and month:
+        cursor.execute("""
+            SELECT country, month, day, neg_hours, avg_market_price, capture_price,
+                   capture_price_floor0, capture_rate, solar_at_neg_price_pct
+            FROM summary_daily 
+            WHERE country = %s AND month = %s
+            ORDER BY day
+        """, (country, month))
+    else:
+        cursor.execute("""
+            SELECT country, month, day, neg_hours, avg_market_price, capture_price,
+                   capture_price_floor0, capture_rate, solar_at_neg_price_pct
+            FROM summary_daily ORDER BY country, month, day
+        """)
+    
+    results = cursor.fetchall()
+    cursor.close()
+    conn.close()
+    
+    data = [{
+        "country": r[0], "month": r[1], "day": r[2], "neg_hours": float(r[3] or 0), 
+        "avg_market_price": float(r[4] or 0), "capture_price": float(r[5] or 0),
+        "capture_price_floor0": float(r[6] or 0), "capture_rate": float(r[7] or 0),
+        "solar_at_neg_price_pct": float(r[8] or 0)
+    } for r in results]
+    return {"data": data}
 
 
-@app.get("/", response_class=HTMLResponse)
-def index():
-    """Serve the main dashboard HTML page."""
-    html_content = """<!DOCTYPE html>
+@app.get("/")
+def home():
+    return HTMLResponse("""
+<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>European Energy Market Dashboard</title>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Sora:wght@300;400;500;600;700&display=swap" rel="stylesheet">
     <style>
         :root {
-            --bg-primary: #0a0e14;
-            --bg-secondary: #111820;
-            --bg-tertiary: #1a2332;
-            --accent-cyan: #00f5d4;
-            --accent-magenta: #f72585;
-            --accent-yellow: #fee440;
-            --accent-orange: #ff6b35;
-            --accent-purple: #9d4edd;
-            --text-primary: #e8eaed;
-            --text-secondary: #9aa5b1;
-            --text-muted: #5c6a7a;
-            --border-color: #2a3a4d;
-            --glow-cyan: 0 0 20px rgba(0, 245, 212, 0.3);
-            --glow-magenta: 0 0 20px rgba(247, 37, 133, 0.3);
+            --bg-dark: #0a0e14;
+            --bg-card: #1a1f2e;
+            --cyan: #00f5d4;
+            --pink: #f72585;
+            --yellow: #fee440;
+            --orange: #ff6b35;
+            --purple: #9d4edd;
+            --blue: #4cc9f0;
+            --text: #e8eaed;
+            --text-muted: #8892a0;
         }
-        
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
-        
+        * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
-            font-family: 'Sora', sans-serif;
-            background: var(--bg-primary);
-            color: var(--text-primary);
+            font-family: 'Segoe UI', system-ui, sans-serif;
+            background: var(--bg-dark);
+            color: var(--text);
             min-height: 100vh;
-            background-image: 
-                radial-gradient(ellipse at 20% 20%, rgba(0, 245, 212, 0.05) 0%, transparent 50%),
-                radial-gradient(ellipse at 80% 80%, rgba(247, 37, 133, 0.05) 0%, transparent 50%),
-                linear-gradient(180deg, var(--bg-primary) 0%, var(--bg-secondary) 100%);
-        }
-        
-        .container {
-            max-width: 1600px;
-            margin: 0 auto;
             padding: 2rem;
         }
-        
-        header {
-            text-align: center;
-            margin-bottom: 3rem;
-            padding: 2rem 0;
-            position: relative;
-        }
-        
-        header::before {
-            content: '';
-            position: absolute;
-            top: 0;
-            left: 50%;
-            transform: translateX(-50%);
-            width: 200px;
-            height: 2px;
-            background: linear-gradient(90deg, transparent, var(--accent-cyan), transparent);
-        }
-        
+        .container { max-width: 1400px; margin: 0 auto; }
+        header { text-align: center; margin-bottom: 2rem; }
         h1 {
-            font-size: 2.5rem;
-            font-weight: 700;
-            background: linear-gradient(135deg, var(--accent-cyan) 0%, var(--accent-magenta) 100%);
+            font-size: 2rem;
+            background: linear-gradient(135deg, var(--cyan), var(--pink));
             -webkit-background-clip: text;
             -webkit-text-fill-color: transparent;
-            background-clip: text;
             margin-bottom: 0.5rem;
-            letter-spacing: -0.02em;
         }
-        
-        .subtitle {
-            color: var(--text-secondary);
-            font-size: 1.1rem;
-            font-weight: 300;
-        }
-        
+        .subtitle { color: var(--text-muted); }
         .controls {
             display: flex;
             gap: 1.5rem;
-            margin-bottom: 2.5rem;
-            flex-wrap: wrap;
             justify-content: center;
-            align-items: center;
+            margin-bottom: 2rem;
+            flex-wrap: wrap;
         }
-        
-        .control-group {
-            display: flex;
-            flex-direction: column;
-            gap: 0.5rem;
-        }
-        
-        .control-group label {
-            font-size: 0.75rem;
-            text-transform: uppercase;
-            letter-spacing: 0.1em;
-            color: var(--text-muted);
-            font-weight: 500;
-        }
-        
+        .control-group { display: flex; flex-direction: column; gap: 0.5rem; }
+        .control-group label { font-size: 0.75rem; text-transform: uppercase; color: var(--text-muted); }
         select {
-            background: var(--bg-tertiary);
-            border: 1px solid var(--border-color);
-            color: var(--text-primary);
-            padding: 0.75rem 1.25rem;
-            font-size: 0.95rem;
-            font-family: 'JetBrains Mono', monospace;
-            border-radius: 8px;
-            cursor: pointer;
-            min-width: 220px;
-            appearance: none;
-            background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' fill='%239aa5b1' viewBox='0 0 16 16'%3E%3Cpath d='M8 11L3 6h10l-5 5z'/%3E%3C/svg%3E");
-            background-repeat: no-repeat;
-            background-position: right 1rem center;
-            transition: all 0.2s ease;
-        }
-        
-        select:hover {
-            border-color: var(--accent-cyan);
-            box-shadow: var(--glow-cyan);
-        }
-        
-        select:focus {
-            outline: none;
-            border-color: var(--accent-cyan);
-            box-shadow: var(--glow-cyan);
-        }
-        
-        .stats-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-            gap: 1.25rem;
-            margin-bottom: 2.5rem;
-        }
-        
-        .stat-card {
-            background: var(--bg-secondary);
-            border: 1px solid var(--border-color);
-            border-radius: 12px;
-            padding: 1.5rem;
-            position: relative;
-            overflow: hidden;
-            transition: all 0.3s ease;
-        }
-        
-        .stat-card::before {
-            content: '';
-            position: absolute;
-            top: 0;
-            left: 0;
-            right: 0;
-            height: 3px;
-        }
-        
-        .stat-card.cyan::before { background: var(--accent-cyan); }
-        .stat-card.magenta::before { background: var(--accent-magenta); }
-        .stat-card.yellow::before { background: var(--accent-yellow); }
-        .stat-card.orange::before { background: var(--accent-orange); }
-        .stat-card.purple::before { background: var(--accent-purple); }
-        
-        .stat-card:hover {
-            transform: translateY(-4px);
-            border-color: var(--text-muted);
-        }
-        
-        .stat-label {
-            font-size: 0.75rem;
-            text-transform: uppercase;
-            letter-spacing: 0.08em;
-            color: var(--text-muted);
-            margin-bottom: 0.5rem;
-        }
-        
-        .stat-value {
-            font-family: 'JetBrains Mono', monospace;
-            font-size: 1.8rem;
-            font-weight: 600;
-        }
-        
-        .stat-card.cyan .stat-value { color: var(--accent-cyan); }
-        .stat-card.magenta .stat-value { color: var(--accent-magenta); }
-        .stat-card.yellow .stat-value { color: var(--accent-yellow); }
-        .stat-card.orange .stat-value { color: var(--accent-orange); }
-        .stat-card.purple .stat-value { color: var(--accent-purple); }
-        
-        .stat-unit {
-            font-size: 0.85rem;
-            color: var(--text-secondary);
-            margin-left: 0.25rem;
-        }
-        
-        .charts-grid {
-            display: grid;
-            grid-template-columns: repeat(2, 1fr);
-            gap: 1.5rem;
-        }
-        
-        @media (max-width: 1200px) {
-            .charts-grid {
-                grid-template-columns: 1fr;
-            }
-        }
-        
-        .chart-container {
-            background: var(--bg-secondary);
-            border: 1px solid var(--border-color);
-            border-radius: 12px;
-            padding: 1.5rem;
-            position: relative;
-        }
-        
-        .chart-title {
+            background: var(--bg-card);
+            border: 1px solid #2a3a4d;
+            color: var(--text);
+            padding: 0.75rem 1rem;
             font-size: 1rem;
-            font-weight: 600;
-            margin-bottom: 1rem;
-            color: var(--text-primary);
-            display: flex;
-            align-items: center;
-            gap: 0.5rem;
-        }
-        
-        .chart-title .dot {
-            width: 8px;
-            height: 8px;
-            border-radius: 50%;
-        }
-        
-        .chart-title .dot.cyan { background: var(--accent-cyan); }
-        .chart-title .dot.magenta { background: var(--accent-magenta); }
-        .chart-title .dot.yellow { background: var(--accent-yellow); }
-        .chart-title .dot.orange { background: var(--accent-orange); }
-        .chart-title .dot.purple { background: var(--accent-purple); }
-        
-        .chart-wrapper {
-            height: 320px;
-            position: relative;
-        }
-        
-        .full-width {
-            grid-column: 1 / -1;
-        }
-        
-        .full-width .chart-wrapper {
-            height: 400px;
-        }
-        
-        .loading {
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            height: 200px;
-            color: var(--text-muted);
-        }
-        
-        .loading-spinner {
-            width: 40px;
-            height: 40px;
-            border: 3px solid var(--border-color);
-            border-top-color: var(--accent-cyan);
-            border-radius: 50%;
-            animation: spin 1s linear infinite;
-        }
-        
-        @keyframes spin {
-            to { transform: rotate(360deg); }
-        }
-        
-        .country-badge {
-            display: inline-flex;
-            align-items: center;
-            gap: 0.5rem;
-            background: var(--bg-tertiary);
-            padding: 0.5rem 1rem;
-            border-radius: 20px;
-            font-size: 0.85rem;
-            color: var(--text-secondary);
-            margin-top: 0.5rem;
-        }
-        
-        .country-badge .flag {
-            font-size: 1.2rem;
-        }
-        
-        footer {
-            text-align: center;
-            padding: 2rem;
-            color: var(--text-muted);
-            font-size: 0.85rem;
-            margin-top: 2rem;
-            border-top: 1px solid var(--border-color);
-        }
-        
-        footer a {
-            color: var(--accent-cyan);
-            text-decoration: none;
-        }
-        
-        .data-table {
-            width: 100%;
-            border-collapse: collapse;
-            margin-top: 1rem;
-            font-size: 0.9rem;
-        }
-        
-        .data-table th,
-        .data-table td {
-            padding: 0.75rem;
-            text-align: left;
-            border-bottom: 1px solid var(--border-color);
-        }
-        
-        .data-table th {
-            font-weight: 500;
-            color: var(--text-muted);
-            text-transform: uppercase;
-            font-size: 0.75rem;
-            letter-spacing: 0.05em;
-        }
-        
-        .data-table td {
-            font-family: 'JetBrains Mono', monospace;
-        }
-        
-        .data-table tr:hover {
-            background: var(--bg-tertiary);
-        }
-        
-        .metric-toggle {
-            display: flex;
-            gap: 0.5rem;
-            flex-wrap: wrap;
-            justify-content: center;
-            margin-bottom: 1.5rem;
-        }
-        
-        .toggle-btn {
-            background: var(--bg-tertiary);
-            border: 1px solid var(--border-color);
-            color: var(--text-secondary);
-            padding: 0.5rem 1rem;
-            font-size: 0.85rem;
-            font-family: 'Sora', sans-serif;
-            border-radius: 6px;
+            border-radius: 8px;
+            min-width: 200px;
             cursor: pointer;
-            transition: all 0.2s ease;
         }
-        
-        .toggle-btn:hover {
-            border-color: var(--text-muted);
+        select:hover { border-color: var(--cyan); }
+        .stats {
+            display: grid;
+            grid-template-columns: repeat(6, 1fr);
+            gap: 1rem;
+            margin-bottom: 2rem;
         }
-        
-        .toggle-btn.active {
-            background: var(--accent-cyan);
-            color: var(--bg-primary);
-            border-color: var(--accent-cyan);
+        @media (max-width: 1200px) { .stats { grid-template-columns: repeat(3, 1fr); } }
+        @media (max-width: 768px) { .stats { grid-template-columns: repeat(2, 1fr); } }
+        .stat-card {
+            background: var(--bg-card);
+            border-radius: 12px;
+            padding: 1.25rem;
+            border-top: 3px solid var(--cyan);
         }
+        .stat-card.pink { border-top-color: var(--pink); }
+        .stat-card.yellow { border-top-color: var(--yellow); }
+        .stat-card.orange { border-top-color: var(--orange); }
+        .stat-card.purple { border-top-color: var(--purple); }
+        .stat-card.blue { border-top-color: var(--blue); }
+        .stat-label { font-size: 0.7rem; color: var(--text-muted); text-transform: uppercase; }
+        .stat-value { font-size: 1.5rem; font-weight: 700; margin-top: 0.3rem; }
+        .stat-card:nth-child(1) .stat-value { color: var(--cyan); }
+        .stat-card:nth-child(2) .stat-value { color: var(--pink); }
+        .stat-card:nth-child(3) .stat-value { color: var(--yellow); }
+        .stat-card:nth-child(4) .stat-value { color: var(--orange); }
+        .stat-card:nth-child(5) .stat-value { color: var(--purple); }
+        .stat-card:nth-child(6) .stat-value { color: var(--blue); }
+        .charts {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 1.25rem;
+        }
+        @media (max-width: 1200px) { .charts { grid-template-columns: repeat(2, 1fr); } }
+        @media (max-width: 768px) { .charts { grid-template-columns: 1fr; } }
+        .chart-card {
+            background: var(--bg-card);
+            border-radius: 12px;
+            padding: 1.25rem;
+        }
+        .chart-title { font-size: 0.9rem; margin-bottom: 0.75rem; color: var(--text-muted); }
+        .chart-container { height: 250px; }
     </style>
 </head>
 <body>
     <div class="container">
         <header>
-            <h1>⚡ European Energy Market</h1>
-            <p class="subtitle">Solar Capture Prices & Negative Price Hours Analysis • 2025</p>
+            <h1>⚡ European Energy Market Dashboard</h1>
+            <p class="subtitle">Solar Capture Prices & Negative Price Hours • 2025</p>
         </header>
         
         <div class="controls">
             <div class="control-group">
                 <label>Bidding Zone</label>
-                <select id="countrySelect">
-                    <option value="all">All Zones (Comparison)</option>
+                <select id="zoneSelect">
+                    <option value="all">All Bidding Zones</option>
+                    <option value="Austria (AT)">Austria (AT)</option>
+                    <option value="Belgium (BE)">Belgium (BE)</option>
+                    <option value="Bulgaria (BG)">Bulgaria (BG)</option>
+                    <option value="Croatia (HR)">Croatia (HR)</option>
+                    <option value="Czech Republic (CZ)">Czech Republic (CZ)</option>
+                    <option value="DE-LU">DE-LU (Germany-Luxembourg)</option>
+                    <option value="DK1">DK1 (Denmark West)</option>
+                    <option value="DK2">DK2 (Denmark East)</option>
+                    <option value="Estonia (EE)">Estonia (EE)</option>
+                    <option value="Finland (FI)">Finland (FI)</option>
+                    <option value="France (FR)">France (FR)</option>
+                    <option value="Greece (GR)">Greece (GR)</option>
+                    <option value="Hungary (HU)">Hungary (HU)</option>
+                    <option value="IE(SEM)">Ireland (SEM)</option>
+                    <option value="IT-Calabria">Italy - Calabria</option>
+                    <option value="IT-Centre-North">Italy - Centre-North</option>
+                    <option value="IT-Centre-South">Italy - Centre-South</option>
+                    <option value="IT-North">Italy - North</option>
+                    <option value="IT-Sardinia">Italy - Sardinia</option>
+                    <option value="IT-Sicily">Italy - Sicily</option>
+                    <option value="IT-South">Italy - South</option>
+                    <option value="Latvia (LV)">Latvia (LV)</option>
+                    <option value="Lithuania (LT)">Lithuania (LT)</option>
+                    <option value="Netherlands (NL)">Netherlands (NL)</option>
+                    <option value="NO1">NO1 (Norway South-East)</option>
+                    <option value="NO2">NO2 (Norway South-West)</option>
+                    <option value="NO3">NO3 (Norway Central)</option>
+                    <option value="NO4">NO4 (Norway North)</option>
+                    <option value="NO5">NO5 (Norway West)</option>
+                    <option value="Poland (PL)">Poland (PL)</option>
+                    <option value="Portugal (PT)">Portugal (PT)</option>
+                    <option value="Romania (RO)">Romania (RO)</option>
+                    <option value="SE1">SE1 (Sweden North)</option>
+                    <option value="SE2">SE2 (Sweden Central-North)</option>
+                    <option value="SE3">SE3 (Sweden Central-South)</option>
+                    <option value="SE4">SE4 (Sweden South)</option>
+                    <option value="Serbia (RS)">Serbia (RS)</option>
+                    <option value="Slovakia (SK)">Slovakia (SK)</option>
+                    <option value="Slovenia (SI)">Slovenia (SI)</option>
+                    <option value="Spain (ES)">Spain (ES)</option>
+                    <option value="Switzerland (CH)">Switzerland (CH)</option>
                 </select>
             </div>
             <div class="control-group">
@@ -860,572 +314,152 @@ def index():
                     <option value="9">September</option>
                     <option value="10">October</option>
                     <option value="11">November</option>
+                    <option value="12">December</option>
                 </select>
             </div>
         </div>
         
-        <div class="stats-grid" id="statsGrid">
-            <div class="stat-card cyan">
-                <div class="stat-label">Negative Price Hours</div>
-                <div class="stat-value" id="statNegHours">—<span class="stat-unit">hrs</span></div>
-            </div>
-            <div class="stat-card magenta">
-                <div class="stat-label">Avg Market Price</div>
-                <div class="stat-value" id="statAvgPrice">—<span class="stat-unit">€/MWh</span></div>
-            </div>
-            <div class="stat-card yellow">
-                <div class="stat-label">Solar Capture Price</div>
-                <div class="stat-value" id="statCapture">—<span class="stat-unit">€/MWh</span></div>
-            </div>
-            <div class="stat-card orange">
-                <div class="stat-label">Capture Price (Floor 0)</div>
-                <div class="stat-value" id="statCaptureFloor">—<span class="stat-unit">€/MWh</span></div>
-            </div>
-            <div class="stat-card purple">
-                <div class="stat-label">Solar at Neg. Prices</div>
-                <div class="stat-value" id="statSolarNeg">—<span class="stat-unit">%</span></div>
-            </div>
+        <div class="stats">
+            <div class="stat-card"><div class="stat-label">Negative Price Hours</div><div class="stat-value" id="val1">—</div></div>
+            <div class="stat-card pink"><div class="stat-label">Avg Market Price</div><div class="stat-value" id="val2">—</div></div>
+            <div class="stat-card yellow"><div class="stat-label">Capture Price</div><div class="stat-value" id="val3">—</div></div>
+            <div class="stat-card orange"><div class="stat-label">Capture (Floor €0)</div><div class="stat-value" id="val4">—</div></div>
+            <div class="stat-card purple"><div class="stat-label">Capture Rate</div><div class="stat-value" id="val5">—</div></div>
+            <div class="stat-card blue"><div class="stat-label">Solar @ Neg Price</div><div class="stat-value" id="val6">—</div></div>
         </div>
         
-        <div class="charts-grid">
-            <div class="chart-container">
-                <div class="chart-title"><span class="dot cyan"></span>Negative Price Hours</div>
-                <div class="chart-wrapper">
-                    <canvas id="negHoursChart"></canvas>
-                </div>
-            </div>
-            
-            <div class="chart-container">
-                <div class="chart-title"><span class="dot magenta"></span>Average Market Price</div>
-                <div class="chart-wrapper">
-                    <canvas id="avgPriceChart"></canvas>
-                </div>
-            </div>
-            
-            <div class="chart-container">
-                <div class="chart-title"><span class="dot yellow"></span>Solar Capture Price</div>
-                <div class="chart-wrapper">
-                    <canvas id="capturePriceChart"></canvas>
-                </div>
-            </div>
-            
-            <div class="chart-container">
-                <div class="chart-title"><span class="dot orange"></span>Capture Price (Floor at 0)</div>
-                <div class="chart-wrapper">
-                    <canvas id="captureFloor0Chart"></canvas>
-                </div>
-            </div>
-            
-            <div class="chart-container full-width">
-                <div class="chart-title"><span class="dot purple"></span>Solar Volume at Negative Prices (%)</div>
-                <div class="chart-wrapper">
-                    <canvas id="solarNegChart"></canvas>
-                </div>
-            </div>
-            
-            <div class="chart-container full-width">
-                <div class="chart-title"><span class="dot cyan"></span>Price Comparison by Zone</div>
-                <div class="chart-wrapper">
-                    <canvas id="comparisonChart"></canvas>
-                </div>
-            </div>
+        <div class="charts">
+            <div class="chart-card"><div class="chart-title">Negative Price Hours</div><div class="chart-container"><canvas id="chart1"></canvas></div></div>
+            <div class="chart-card"><div class="chart-title">Avg Market Price (€/MWh)</div><div class="chart-container"><canvas id="chart2"></canvas></div></div>
+            <div class="chart-card"><div class="chart-title">Capture Price (€/MWh)</div><div class="chart-container"><canvas id="chart3"></canvas></div></div>
+            <div class="chart-card"><div class="chart-title">Capture Price Floor €0 (€/MWh)</div><div class="chart-container"><canvas id="chart4"></canvas></div></div>
+            <div class="chart-card"><div class="chart-title">Capture Rate (%)</div><div class="chart-container"><canvas id="chart5"></canvas></div></div>
+            <div class="chart-card"><div class="chart-title">Solar Volume @ Neg Price (%)</div><div class="chart-container"><canvas id="chart6"></canvas></div></div>
         </div>
-        
-        <footer>
-            Data source: ENTSO-E Transparency Platform • Dashboard built with DuckDB & Chart.js
-        </footer>
     </div>
     
     <script>
-        const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
-        const CHART_COLORS = {
-            cyan: 'rgba(0, 245, 212, 1)',
-            cyanBg: 'rgba(0, 245, 212, 0.2)',
-            magenta: 'rgba(247, 37, 133, 1)',
-            magentaBg: 'rgba(247, 37, 133, 0.2)',
-            yellow: 'rgba(254, 228, 64, 1)',
-            yellowBg: 'rgba(254, 228, 64, 0.2)',
-            orange: 'rgba(255, 107, 53, 1)',
-            orangeBg: 'rgba(255, 107, 53, 0.2)',
-            purple: 'rgba(157, 78, 221, 1)',
-            purpleBg: 'rgba(157, 78, 221, 0.2)',
-        };
-        
-        let allData = [];
-        let dailyData = [];
+        let yearlyData = [], monthlyData = [], totalData = {};
         let charts = {};
+        const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+        const COLORS = ['#00f5d4','#f72585','#fee440','#ff6b35','#9d4edd','#4cc9f0'];
         
-        const chartOptions = {
-            responsive: true,
-            maintainAspectRatio: false,
-            plugins: {
-                legend: {
-                    display: false,
-                },
-                tooltip: {
-                    backgroundColor: 'rgba(17, 24, 32, 0.95)',
-                    titleColor: '#e8eaed',
-                    bodyColor: '#9aa5b1',
-                    borderColor: '#2a3a4d',
-                    borderWidth: 1,
-                    padding: 12,
-                    titleFont: { family: 'Sora', weight: 600 },
-                    bodyFont: { family: 'JetBrains Mono' },
-                }
-            },
-            scales: {
-                x: {
-                    grid: { color: 'rgba(42, 58, 77, 0.5)', drawBorder: false },
-                    ticks: { color: '#5c6a7a', font: { family: 'Sora', size: 11 } }
-                },
-                y: {
-                    grid: { color: 'rgba(42, 58, 77, 0.5)', drawBorder: false },
-                    ticks: { color: '#5c6a7a', font: { family: 'JetBrains Mono', size: 11 } }
-                }
-            }
-        };
-        
-        async function fetchData() {
-            const response = await fetch('/api/data');
-            const json = await response.json();
-            return json.data;
+        async function loadData() {
+            const [t, y, m] = await Promise.all([
+                fetch('/api/summary/total').then(r => r.json()),
+                fetch('/api/summary/yearly').then(r => r.json()),
+                fetch('/api/summary/monthly').then(r => r.json())
+            ]);
+            totalData = t; yearlyData = y.data; monthlyData = m.data;
+            updateDisplay();
         }
         
-        async function fetchDailyData() {
-            const response = await fetch('/api/daily-data');
-            const json = await response.json();
-            return json.data;
-        }
-        
-        async function fetchCountries() {
-            const response = await fetch('/api/countries');
-            const json = await response.json();
-            return json.countries;
-        }
-        
-        function initCharts() {
-            const ctxNeg = document.getElementById('negHoursChart').getContext('2d');
-            const ctxAvg = document.getElementById('avgPriceChart').getContext('2d');
-            const ctxCapture = document.getElementById('capturePriceChart').getContext('2d');
-            const ctxFloor = document.getElementById('captureFloor0Chart').getContext('2d');
-            const ctxSolarNeg = document.getElementById('solarNegChart').getContext('2d');
-            const ctxComparison = document.getElementById('comparisonChart').getContext('2d');
+        async function updateDisplay() {
+            const zone = document.getElementById('zoneSelect').value;
+            const month = document.getElementById('monthSelect').value;
+            let d, labels, datasets;
             
-            charts.negHours = new Chart(ctxNeg, {
-                type: 'bar',
-                data: { labels: [], datasets: [] },
-                options: { ...chartOptions, plugins: { ...chartOptions.plugins, legend: { display: false } } }
-            });
-            
-            charts.avgPrice = new Chart(ctxAvg, {
-                type: 'bar',
-                data: { labels: [], datasets: [] },
-                options: { ...chartOptions, plugins: { ...chartOptions.plugins, legend: { display: false } } }
-            });
-            
-            charts.capturePrice = new Chart(ctxCapture, {
-                type: 'bar',
-                data: { labels: [], datasets: [] },
-                options: { ...chartOptions, plugins: { ...chartOptions.plugins, legend: { display: false } } }
-            });
-            
-            charts.captureFloor0 = new Chart(ctxFloor, {
-                type: 'bar',
-                data: { labels: [], datasets: [] },
-                options: { ...chartOptions, plugins: { ...chartOptions.plugins, legend: { display: false } } }
-            });
-            
-            charts.solarNeg = new Chart(ctxSolarNeg, {
-                type: 'bar',
-                data: { labels: [], datasets: [] },
-                options: {
-                    ...chartOptions,
-                    plugins: {
-                        ...chartOptions.plugins,
-                        legend: { display: false }
-                    },
-                    scales: {
-                        ...chartOptions.scales,
-                        y: { 
-                            ...chartOptions.scales.y, 
-                            max: 100,
-                            ticks: { 
-                                ...chartOptions.scales.y.ticks,
-                                callback: function(value) { return value + '%'; }
-                            }
-                        },
-                        x: { ...chartOptions.scales.x, ticks: { ...chartOptions.scales.x.ticks, maxRotation: 45, minRotation: 45 } }
-                    }
-                }
-            });
-            
-            charts.comparison = new Chart(ctxComparison, {
-                type: 'bar',
-                data: { labels: [], datasets: [] },
-                options: {
-                    ...chartOptions,
-                    plugins: {
-                        ...chartOptions.plugins,
-                        legend: {
-                            display: true,
-                            position: 'top',
-                            labels: { color: '#9aa5b1', font: { family: 'Sora', size: 11 }, boxWidth: 12, padding: 15 }
-                        }
-                    },
-                    scales: {
-                        ...chartOptions.scales,
-                        x: { ...chartOptions.scales.x, ticks: { ...chartOptions.scales.x.ticks, maxRotation: 45, minRotation: 45 } }
-                    }
-                }
-            });
-        }
-        
-        function updateCharts(country, month) {
-            let filtered = allData;
-            
-            if (country !== 'all') {
-                filtered = filtered.filter(d => d.country === country);
-            }
-            if (month !== 'all') {
-                filtered = filtered.filter(d => d.month === parseInt(month));
-            }
-            
-            // Update stats
-            const totalNegHours = filtered.reduce((sum, d) => sum + d.neg_hours, 0);
-            const avgMarketPrice = filtered.length > 0 ? (filtered.reduce((sum, d) => sum + d.avg_market_price, 0) / filtered.length) : 0;
-            const avgCapture = filtered.length > 0 ? (filtered.reduce((sum, d) => sum + d.capture_price, 0) / filtered.length) : 0;
-            const avgCaptureFloor = filtered.length > 0 ? (filtered.reduce((sum, d) => sum + d.capture_price_floor0, 0) / filtered.length) : 0;
-            const avgSolarNeg = filtered.length > 0 ? (filtered.reduce((sum, d) => sum + d.solar_at_neg_price_pct, 0) / filtered.length) : 0;
-            
-            document.getElementById('statNegHours').innerHTML = `${totalNegHours.toFixed(1)}<span class="stat-unit">hrs</span>`;
-            document.getElementById('statAvgPrice').innerHTML = `${avgMarketPrice.toFixed(2)}<span class="stat-unit">€/MWh</span>`;
-            document.getElementById('statCapture').innerHTML = `${avgCapture.toFixed(2)}<span class="stat-unit">€/MWh</span>`;
-            document.getElementById('statCaptureFloor').innerHTML = `${avgCaptureFloor.toFixed(2)}<span class="stat-unit">€/MWh</span>`;
-            document.getElementById('statSolarNeg').innerHTML = `${avgSolarNeg.toFixed(1)}<span class="stat-unit">%</span>`;
-            
-            if (country !== 'all' && month !== 'all') {
-                // Single country + specific month view - show DAILY data
-                const dailyCountryData = dailyData
-                    .filter(d => d.country === country && d.month === parseInt(month))
-                    .sort((a, b) => a.day - b.day);
-                const labels = dailyCountryData.map(d => d.day.toString());
-                
-                charts.negHours.data = {
-                    labels,
-                    datasets: [{
-                        data: dailyCountryData.map(d => d.neg_hours),
-                        backgroundColor: CHART_COLORS.cyanBg,
-                        borderColor: CHART_COLORS.cyan,
-                        borderWidth: 2,
-                        borderRadius: 4,
-                    }]
+            if (zone === 'all' && month === 'all') {
+                d = totalData;
+                const sorted = [...yearlyData].sort((a,b) => b.neg_hours - a.neg_hours).slice(0, 12);
+                labels = sorted.map(x => x.country.substring(0, 12));
+                datasets = [
+                    sorted.map(x => x.neg_hours), sorted.map(x => x.avg_market_price),
+                    sorted.map(x => x.capture_price), sorted.map(x => x.capture_price_floor0),
+                    sorted.map(x => x.capture_rate), sorted.map(x => x.solar_at_neg_price_pct)
+                ];
+            } else if (zone !== 'all' && month === 'all') {
+                const yd = yearlyData.find(x => x.country === zone) || {};
+                d = { neg_hours: yd.neg_hours||0, avg_market_price: yd.avg_market_price||0,
+                      capture_price: yd.capture_price||0, capture_price_floor0: yd.capture_price_floor0||0,
+                      capture_rate: yd.capture_rate||0, solar_at_neg_price_pct: yd.solar_at_neg_price_pct||0 };
+                const md = monthlyData.filter(x => x.country === zone).sort((a,b) => a.month - b.month);
+                labels = md.map(x => MONTHS[x.month - 1]);
+                datasets = [
+                    md.map(x => x.neg_hours), md.map(x => x.avg_market_price),
+                    md.map(x => x.capture_price), md.map(x => x.capture_price_floor0),
+                    md.map(x => x.capture_rate), md.map(x => x.solar_at_neg_price_pct)
+                ];
+            } else if (zone === 'all' && month !== 'all') {
+                const md = monthlyData.filter(x => x.month === parseInt(month));
+                d = {
+                    neg_hours: md.reduce((s,x) => s + x.neg_hours, 0),
+                    avg_market_price: md.length ? md.reduce((s,x) => s + x.avg_market_price, 0) / md.length : 0,
+                    capture_price: md.length ? md.reduce((s,x) => s + x.capture_price, 0) / md.length : 0,
+                    capture_price_floor0: md.length ? md.reduce((s,x) => s + x.capture_price_floor0, 0) / md.length : 0,
+                    capture_rate: md.length ? md.reduce((s,x) => s + x.capture_rate, 0) / md.length : 0,
+                    solar_at_neg_price_pct: md.length ? md.reduce((s,x) => s + x.solar_at_neg_price_pct, 0) / md.length : 0
                 };
-                
-                charts.avgPrice.data = {
-                    labels,
-                    datasets: [{
-                        data: dailyCountryData.map(d => d.avg_market_price),
-                        backgroundColor: CHART_COLORS.magentaBg,
-                        borderColor: CHART_COLORS.magenta,
-                        borderWidth: 2,
-                        borderRadius: 4,
-                    }]
-                };
-                
-                charts.capturePrice.data = {
-                    labels,
-                    datasets: [{
-                        data: dailyCountryData.map(d => d.capture_price),
-                        backgroundColor: CHART_COLORS.yellowBg,
-                        borderColor: CHART_COLORS.yellow,
-                        borderWidth: 2,
-                        borderRadius: 4,
-                    }]
-                };
-                
-                charts.captureFloor0.data = {
-                    labels,
-                    datasets: [{
-                        data: dailyCountryData.map(d => d.capture_price_floor0),
-                        backgroundColor: CHART_COLORS.orangeBg,
-                        borderColor: CHART_COLORS.orange,
-                        borderWidth: 2,
-                        borderRadius: 4,
-                    }]
-                };
-                
-                charts.solarNeg.data = {
-                    labels,
-                    datasets: [{
-                        data: dailyCountryData.map(d => d.solar_at_neg_price_pct),
-                        backgroundColor: CHART_COLORS.purpleBg,
-                        borderColor: CHART_COLORS.purple,
-                        borderWidth: 2,
-                        borderRadius: 4,
-                    }]
-                };
-                
-            } else if (country !== 'all') {
-                // Single country view (full year) - show MONTHLY data
-                const countryData = allData.filter(d => d.country === country);
-                const labels = countryData.map(d => MONTHS[d.month - 1]);
-                
-                charts.negHours.data = {
-                    labels,
-                    datasets: [{
-                        data: countryData.map(d => d.neg_hours),
-                        backgroundColor: CHART_COLORS.cyanBg,
-                        borderColor: CHART_COLORS.cyan,
-                        borderWidth: 2,
-                        borderRadius: 4,
-                    }]
-                };
-                
-                charts.avgPrice.data = {
-                    labels,
-                    datasets: [{
-                        data: countryData.map(d => d.avg_market_price),
-                        backgroundColor: CHART_COLORS.magentaBg,
-                        borderColor: CHART_COLORS.magenta,
-                        borderWidth: 2,
-                        borderRadius: 4,
-                    }]
-                };
-                
-                charts.capturePrice.data = {
-                    labels,
-                    datasets: [{
-                        data: countryData.map(d => d.capture_price),
-                        backgroundColor: CHART_COLORS.yellowBg,
-                        borderColor: CHART_COLORS.yellow,
-                        borderWidth: 2,
-                        borderRadius: 4,
-                    }]
-                };
-                
-                charts.captureFloor0.data = {
-                    labels,
-                    datasets: [{
-                        data: countryData.map(d => d.capture_price_floor0),
-                        backgroundColor: CHART_COLORS.orangeBg,
-                        borderColor: CHART_COLORS.orange,
-                        borderWidth: 2,
-                        borderRadius: 4,
-                    }]
-                };
-                
-                charts.solarNeg.data = {
-                    labels,
-                    datasets: [{
-                        data: countryData.map(d => d.solar_at_neg_price_pct),
-                        backgroundColor: CHART_COLORS.purpleBg,
-                        borderColor: CHART_COLORS.purple,
-                        borderWidth: 2,
-                        borderRadius: 4,
-                    }]
-                };
-                
+                const sorted = [...md].sort((a,b) => b.neg_hours - a.neg_hours).slice(0, 12);
+                labels = sorted.map(x => x.country.substring(0, 12));
+                datasets = [
+                    sorted.map(x => x.neg_hours), sorted.map(x => x.avg_market_price),
+                    sorted.map(x => x.capture_price), sorted.map(x => x.capture_price_floor0),
+                    sorted.map(x => x.capture_rate), sorted.map(x => x.solar_at_neg_price_pct)
+                ];
             } else {
-                // All countries view - aggregate or filter by month
-                let aggregated;
-                if (month !== 'all') {
-                    aggregated = allData.filter(d => d.month === parseInt(month));
-                } else {
-                    // Aggregate by country across all months
-                    const byCountry = {};
-                    allData.forEach(d => {
-                        if (!byCountry[d.country]) {
-                            byCountry[d.country] = { neg_hours: 0, avg_market_price: 0, capture_price: 0, capture_price_floor0: 0, solar_at_neg_price_pct: 0, count: 0 };
-                        }
-                        byCountry[d.country].neg_hours += d.neg_hours;
-                        byCountry[d.country].avg_market_price += d.avg_market_price;
-                        byCountry[d.country].capture_price += d.capture_price;
-                        byCountry[d.country].capture_price_floor0 += d.capture_price_floor0;
-                        byCountry[d.country].solar_at_neg_price_pct += d.solar_at_neg_price_pct;
-                        byCountry[d.country].count++;
-                    });
-                    aggregated = Object.entries(byCountry).map(([country, data]) => ({
-                        country,
-                        neg_hours: data.neg_hours,
-                        avg_market_price: data.avg_market_price / data.count,
-                        capture_price: data.capture_price / data.count,
-                        capture_price_floor0: data.capture_price_floor0 / data.count,
-                        solar_at_neg_price_pct: data.solar_at_neg_price_pct / data.count,
-                    }));
+                // Single zone + single month -> fetch DAILY data
+                const dailyRes = await fetch(`/api/summary/daily?country=${encodeURIComponent(zone)}&month=${month}`);
+                const dailyData = (await dailyRes.json()).data;
+                
+                // Calculate totals for stat cards
+                d = {
+                    neg_hours: dailyData.reduce((s,x) => s + x.neg_hours, 0),
+                    avg_market_price: dailyData.length ? dailyData.reduce((s,x) => s + x.avg_market_price, 0) / dailyData.length : 0,
+                    capture_price: dailyData.length ? dailyData.reduce((s,x) => s + x.capture_price, 0) / dailyData.length : 0,
+                    capture_price_floor0: dailyData.length ? dailyData.reduce((s,x) => s + x.capture_price_floor0, 0) / dailyData.length : 0,
+                    capture_rate: dailyData.length ? dailyData.reduce((s,x) => s + x.capture_rate, 0) / dailyData.length : 0,
+                    solar_at_neg_price_pct: dailyData.length ? dailyData.reduce((s,x) => s + x.solar_at_neg_price_pct, 0) / dailyData.length : 0
+                };
+                
+                // Daily labels (1, 2, 3, ... 31)
+                const sorted = dailyData.sort((a,b) => a.day - b.day);
+                labels = sorted.map(x => x.day.toString());
+                datasets = [
+                    sorted.map(x => x.neg_hours), sorted.map(x => x.avg_market_price),
+                    sorted.map(x => x.capture_price), sorted.map(x => x.capture_price_floor0),
+                    sorted.map(x => x.capture_rate), sorted.map(x => x.solar_at_neg_price_pct)
+                ];
+            }
+            
+            document.getElementById('val1').textContent = (d.neg_hours||0).toFixed(1) + ' hrs';
+            document.getElementById('val2').textContent = '€' + (d.avg_market_price||0).toFixed(2);
+            document.getElementById('val3').textContent = '€' + (d.capture_price||0).toFixed(2);
+            document.getElementById('val4').textContent = '€' + (d.capture_price_floor0||0).toFixed(2);
+            document.getElementById('val5').textContent = (d.capture_rate||0).toFixed(1) + '%';
+            document.getElementById('val6').textContent = (d.solar_at_neg_price_pct||0).toFixed(1) + '%';
+            
+            updateCharts(labels, datasets);
+        }
+        
+        function updateCharts(labels, datasets) {
+            const opts = {
+                responsive: true, maintainAspectRatio: false,
+                plugins: { legend: { display: false } },
+                scales: {
+                    x: { ticks: { color: '#8892a0', maxRotation: 45 }, grid: { color: '#2a3a4d' } },
+                    y: { ticks: { color: '#8892a0' }, grid: { color: '#2a3a4d' } }
                 }
-                
-                // Sort by negative hours descending
-                aggregated.sort((a, b) => b.neg_hours - a.neg_hours);
-                const top15 = aggregated.slice(0, 15);
-                const labels = top15.map(d => d.country.replace(/\\s*\\([^)]+\\)/, ''));
-                
-                charts.negHours.data = {
-                    labels,
-                    datasets: [{
-                        data: top15.map(d => d.neg_hours),
-                        backgroundColor: CHART_COLORS.cyanBg,
-                        borderColor: CHART_COLORS.cyan,
-                        borderWidth: 2,
-                        borderRadius: 4,
-                    }]
-                };
-                
-                // Sort by avg price for that chart
-                const byAvgPrice = [...aggregated].sort((a, b) => b.avg_market_price - a.avg_market_price).slice(0, 15);
-                charts.avgPrice.data = {
-                    labels: byAvgPrice.map(d => d.country.replace(/\\s*\\([^)]+\\)/, '')),
-                    datasets: [{
-                        data: byAvgPrice.map(d => d.avg_market_price),
-                        backgroundColor: CHART_COLORS.magentaBg,
-                        borderColor: CHART_COLORS.magenta,
-                        borderWidth: 2,
-                        borderRadius: 4,
-                    }]
-                };
-                
-                // Sort by capture price for that chart
-                const byCapture = [...aggregated].sort((a, b) => b.capture_price - a.capture_price).slice(0, 15);
-                charts.capturePrice.data = {
-                    labels: byCapture.map(d => d.country.replace(/\\s*\\([^)]+\\)/, '')),
-                    datasets: [{
-                        data: byCapture.map(d => d.capture_price),
-                        backgroundColor: CHART_COLORS.yellowBg,
-                        borderColor: CHART_COLORS.yellow,
-                        borderWidth: 2,
-                        borderRadius: 4,
-                    }]
-                };
-                
-                // Sort by capture floor for that chart
-                const byCaptureFloor = [...aggregated].sort((a, b) => b.capture_price_floor0 - a.capture_price_floor0).slice(0, 15);
-                charts.captureFloor0.data = {
-                    labels: byCaptureFloor.map(d => d.country.replace(/\\s*\\([^)]+\\)/, '')),
-                    datasets: [{
-                        data: byCaptureFloor.map(d => d.capture_price_floor0),
-                        backgroundColor: CHART_COLORS.orangeBg,
-                        borderColor: CHART_COLORS.orange,
-                        borderWidth: 2,
-                        borderRadius: 4,
-                    }]
-                };
-                
-                // Update solar neg chart for all countries view
-                const solarNegData = [...aggregated].sort((a, b) => b.solar_at_neg_price_pct - a.solar_at_neg_price_pct).slice(0, 15);
-                charts.solarNeg.data = {
-                    labels: solarNegData.map(d => d.country.replace(/\\s*\\([^)]+\\)/, '')),
-                    datasets: [{
-                        data: solarNegData.map(d => d.solar_at_neg_price_pct),
-                        backgroundColor: CHART_COLORS.purpleBg,
-                        borderColor: CHART_COLORS.purple,
-                        borderWidth: 2,
-                        borderRadius: 4,
-                    }]
-                };
-            }
-            
-            // Update comparison chart - top 10 countries by negative hours
-            let comparisonData;
-            if (month !== 'all') {
-                comparisonData = allData.filter(d => d.month === parseInt(month));
-            } else {
-                const byCountry = {};
-                allData.forEach(d => {
-                    if (!byCountry[d.country]) {
-                        byCountry[d.country] = { neg_hours: 0, avg_market_price: 0, capture_price: 0, capture_price_floor0: 0, solar_at_neg_price_pct: 0, count: 0 };
-                    }
-                    byCountry[d.country].neg_hours += d.neg_hours;
-                    byCountry[d.country].avg_market_price += d.avg_market_price;
-                    byCountry[d.country].capture_price += d.capture_price;
-                    byCountry[d.country].capture_price_floor0 += d.capture_price_floor0;
-                    byCountry[d.country].solar_at_neg_price_pct += d.solar_at_neg_price_pct;
-                    byCountry[d.country].count++;
-                });
-                comparisonData = Object.entries(byCountry).map(([country, data]) => ({
-                    country,
-                    neg_hours: data.neg_hours,
-                    avg_market_price: data.avg_market_price / data.count,
-                    capture_price: data.capture_price / data.count,
-                    capture_price_floor0: data.capture_price_floor0 / data.count,
-                    solar_at_neg_price_pct: data.solar_at_neg_price_pct / data.count,
-                }));
-            }
-            
-            comparisonData.sort((a, b) => b.neg_hours - a.neg_hours);
-            const top10 = comparisonData.slice(0, 10);
-            
-            charts.comparison.data = {
-                labels: top10.map(d => d.country.replace(/\\s*\\([^)]+\\)/, '')),
-                datasets: [
-                    {
-                        label: 'Avg Market Price (€/MWh)',
-                        data: top10.map(d => d.avg_market_price),
-                        backgroundColor: CHART_COLORS.magentaBg,
-                        borderColor: CHART_COLORS.magenta,
-                        borderWidth: 2,
-                        borderRadius: 4,
-                    },
-                    {
-                        label: 'Capture Price (€/MWh)',
-                        data: top10.map(d => d.capture_price),
-                        backgroundColor: CHART_COLORS.yellowBg,
-                        borderColor: CHART_COLORS.yellow,
-                        borderWidth: 2,
-                        borderRadius: 4,
-                    },
-                    {
-                        label: 'Capture Price Floor 0 (€/MWh)',
-                        data: top10.map(d => d.capture_price_floor0),
-                        backgroundColor: CHART_COLORS.orangeBg,
-                        borderColor: CHART_COLORS.orange,
-                        borderWidth: 2,
-                        borderRadius: 4,
-                    },
-                ]
             };
-            
-            // Update all charts
-            Object.values(charts).forEach(chart => chart.update());
+            for (let i = 0; i < 6; i++) {
+                if (charts[i]) charts[i].destroy();
+                charts[i] = new Chart(document.getElementById('chart' + (i+1)), {
+                    type: 'bar',
+                    data: { labels, datasets: [{ data: datasets[i], backgroundColor: COLORS[i] + '99', borderColor: COLORS[i], borderWidth: 1 }] },
+                    options: opts
+                });
+            }
         }
         
-        async function init() {
-            initCharts();
-            
-            // Fetch data (monthly and daily)
-            allData = await fetchData();
-            dailyData = await fetchDailyData();
-            const countries = await fetchCountries();
-            
-            // Populate country select
-            const countrySelect = document.getElementById('countrySelect');
-            countries.forEach(country => {
-                const option = document.createElement('option');
-                option.value = country;
-                option.textContent = country;
-                countrySelect.appendChild(option);
-            });
-            
-            // Event listeners
-            countrySelect.addEventListener('change', () => {
-                updateCharts(countrySelect.value, document.getElementById('monthSelect').value);
-            });
-            
-            document.getElementById('monthSelect').addEventListener('change', () => {
-                updateCharts(countrySelect.value, document.getElementById('monthSelect').value);
-            });
-            
-            // Initial render
-            updateCharts('all', 'all');
-        }
-        
-        init();
+        document.getElementById('zoneSelect').addEventListener('change', updateDisplay);
+        document.getElementById('monthSelect').addEventListener('change', updateDisplay);
+        loadData();
     </script>
 </body>
 </html>
-"""
-    return html_content
+""")
 
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
-
+    uvicorn.run(app, host="0.0.0.0", port=8080)
