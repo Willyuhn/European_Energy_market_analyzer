@@ -5,16 +5,16 @@ Full featured with capture prices and summary tables
 
 import os
 from fastapi import FastAPI
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, FileResponse
 import mysql.connector
 
 app = FastAPI(title="European Energy Market Dashboard")
 
 # Database configuration (set via environment variables)
-DB_HOST = os.environ['DB_HOST']
+DB_HOST = os.environ.get('DB_HOST', '35.187.43.229')
 DB_PORT = int(os.getenv('DB_PORT', '3306'))
-DB_USER = os.environ['DB_USER']
-DB_PASSWORD = os.environ['DB_PASSWORD']
+DB_USER = os.environ.get('DB_USER', 'root')
+DB_PASSWORD = os.environ.get('DB_PASSWORD', 'YourSecurePassword123!')
 DB_NAME = os.getenv('DB_NAME', 'energy_market')
 
 
@@ -26,83 +26,13 @@ def get_db_connection():
 
 
 @app.get("/health")
-def health_check():
-    """Health check for Cloud Run"""
+def health():
     try:
         conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("SELECT 1")
-        cursor.fetchone()
-        cursor.close()
         conn.close()
         return {"status": "healthy", "database": "connected"}
     except Exception as e:
         return {"status": "unhealthy", "error": str(e)}
-
-
-@app.post("/admin/update-summaries")
-def update_summaries(secret: str = ""):
-    """
-    Recalculate all summary tables.
-    Triggered by Cloud Scheduler at 6 AM daily.
-    Requires secret key for security.
-    """
-    # Simple security check
-    expected_secret = os.getenv("UPDATE_SECRET", "your-secret-key")
-    if secret != expected_secret:
-        return {"error": "Unauthorized"}, 401
-    
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
-        # Recalculate summary_monthly
-        cursor.execute("DELETE FROM summary_monthly")
-        cursor.execute("""
-            INSERT INTO summary_monthly (country, month, neg_hours, avg_market_price)
-            WITH prices_raw AS (
-                SELECT AreaDisplayName, `DateTime(UTC)`, ResolutionCode, `Price[Currency/MWh]`, source_month,
-                    SUM(CASE WHEN ResolutionCode = 'PT60M' THEN 1 ELSE 0 END) 
-                    OVER (PARTITION BY AreaDisplayName, `DateTime(UTC)`) AS cnt_60m_same_ts
-                FROM energy_prices
-                WHERE ContractType = 'Day-ahead' AND (`Sequence` IS NULL OR `Sequence` NOT IN ('2', '3'))
-            ),
-            prices_dedup AS (
-                SELECT * FROM prices_raw
-                WHERE ResolutionCode = 'PT60M' OR (ResolutionCode = 'PT15M' AND cnt_60m_same_ts = 0)
-            )
-            SELECT AreaDisplayName, source_month,
-                SUM(CASE WHEN ResolutionCode = 'PT60M' AND `Price[Currency/MWh]` < 0 THEN 1.0
-                         WHEN ResolutionCode = 'PT15M' AND `Price[Currency/MWh]` < 0 THEN 0.25 ELSE 0.0 END),
-                ROUND(AVG(`Price[Currency/MWh]`), 2)
-            FROM prices_dedup GROUP BY AreaDisplayName, source_month
-        """)
-        conn.commit()
-        
-        # Recalculate summary_yearly
-        cursor.execute("DELETE FROM summary_yearly")
-        cursor.execute("""
-            INSERT INTO summary_yearly (country, total_neg_hours, avg_market_price)
-            SELECT country, SUM(neg_hours), ROUND(AVG(avg_market_price), 2)
-            FROM summary_monthly GROUP BY country
-        """)
-        conn.commit()
-        
-        # Recalculate summary_total
-        cursor.execute("DELETE FROM summary_total")
-        cursor.execute("""
-            INSERT INTO summary_total (id, total_neg_hours, avg_market_price)
-            SELECT 1, SUM(total_neg_hours), ROUND(AVG(avg_market_price), 2)
-            FROM summary_yearly
-        """)
-        conn.commit()
-        
-        cursor.close()
-        conn.close()
-        
-        return {"status": "success", "message": "Summary tables updated"}
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
 
 
 @app.get("/api/summary/total")
@@ -173,7 +103,6 @@ def get_summary_monthly():
 
 @app.get("/api/summary/daily")
 def get_summary_daily(country: str = None, month: int = None):
-    """Get daily summary for a specific country and month"""
     conn = get_db_connection()
     cursor = conn.cursor()
     
@@ -205,17 +134,9 @@ def get_summary_daily(country: str = None, month: int = None):
     return {"data": data}
 
 
-@app.get("/")
-def home():
-    return HTMLResponse("""
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>European Energy Market Dashboard</title>
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-    <style>
+# Common styles
+def get_base_styles():
+    return """
         :root {
             --bg-dark: #0a0e14;
             --bg-card: #1a1f2e;
@@ -234,18 +155,117 @@ def home():
             background: var(--bg-dark);
             color: var(--text);
             min-height: 100vh;
-            padding: 2rem;
         }
-        .container { max-width: 1400px; margin: 0 auto; }
-        header { text-align: center; margin-bottom: 2rem; }
+        .container { max-width: 1400px; margin: 0 auto; padding: 2rem; }
+        
+        nav {
+            background: var(--bg-card);
+            padding: 1rem 2rem;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-bottom: 1px solid #2a3a4d;
+        }
+        .logo {
+            font-size: 1.8rem;
+            font-weight: 700;
+            background: linear-gradient(135deg, var(--cyan), var(--pink));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            text-decoration: none;
+        }
+        .nav-links {
+            display: flex;
+            gap: 2rem;
+            list-style: none;
+        }
+        .nav-links a {
+            color: var(--text-muted);
+            text-decoration: none;
+            font-size: 0.95rem;
+            transition: color 0.2s;
+        }
+        .nav-links a:hover, .nav-links a.active { color: var(--cyan); }
+        .dropdown { position: relative; }
+        .dropdown-content {
+            display: none;
+            position: absolute;
+            top: 100%;
+            left: 0;
+            background: var(--bg-card);
+            border: 1px solid #2a3a4d;
+            border-radius: 8px;
+            min-width: 160px;
+            padding: 0.5rem 0;
+            z-index: 100;
+        }
+        .dropdown:hover .dropdown-content { display: block; }
+        .dropdown-content a { display: block; padding: 0.5rem 1rem; }
+        
+        header { text-align: center; margin-bottom: 2rem; padding-top: 1rem; }
         h1 {
-            font-size: 2rem;
+            font-size: 2.5rem;
             background: linear-gradient(135deg, var(--cyan), var(--pink));
             -webkit-background-clip: text;
             -webkit-text-fill-color: transparent;
             margin-bottom: 0.5rem;
         }
-        .subtitle { color: var(--text-muted); }
+        .subtitle { color: var(--text-muted); font-size: 1.1rem; }
+        
+        .page-content { max-width: 800px; margin: 0 auto; padding: 2rem; }
+        .page-content h2 { color: var(--cyan); margin-bottom: 1.5rem; font-size: 1.8rem; }
+        .page-content p { color: var(--text-muted); line-height: 1.8; margin-bottom: 1rem; }
+        .profile-section { display: flex; gap: 2rem; align-items: flex-start; margin-bottom: 2rem; }
+        .profile-img { width: 180px; height: 180px; border-radius: 50%; object-fit: cover; border: 3px solid var(--cyan); }
+        .social-links { display: flex; gap: 1.5rem; margin-top: 2rem; }
+        .social-links a {
+            display: flex; align-items: center; gap: 0.5rem;
+            color: var(--text); text-decoration: none;
+            padding: 0.75rem 1.5rem; background: var(--bg-card);
+            border-radius: 8px; transition: all 0.2s;
+        }
+        .social-links a:hover { background: var(--cyan); color: var(--bg-dark); }
+        .social-links svg { width: 24px; height: 24px; }
+        .method-card { background: var(--bg-card); border-radius: 12px; padding: 1.5rem; margin-bottom: 1.5rem; }
+        .method-card h3 { color: var(--yellow); margin-bottom: 0.75rem; }
+        .formula { background: #0d1117; padding: 1rem; border-radius: 8px; font-family: monospace; color: var(--cyan); margin: 1rem 0; }
+    """
+
+
+def get_nav_html(active=""):
+    return f"""
+    <nav>
+        <a href="/" class="logo">enerlyzer</a>
+        <ul class="nav-links">
+            <li><a href="/" class="{'active' if active=='dashboard' else ''}">Dashboard</a></li>
+            <li class="dropdown">
+                <a href="#" class="{'active' if active in ['project','about-me'] else ''}">About ▾</a>
+                <div class="dropdown-content">
+                    <a href="/about/project">The Project</a>
+                    <a href="/about/me">About Me</a>
+                </div>
+            </li>
+            <li><a href="/methodology" class="{'active' if active=='methodology' else ''}">Methodology</a></li>
+            <li><a href="/contact" class="{'active' if active=='contact' else ''}">Contact</a></li>
+        </ul>
+    </nav>
+    """
+
+
+@app.get("/")
+def home():
+    styles = get_base_styles()
+    nav = get_nav_html('dashboard')
+    return HTMLResponse("""
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>enerlyzer - European Energy Market Dashboard</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        """ + styles + """
         .controls {
             display: flex;
             gap: 1.5rem;
@@ -310,10 +330,11 @@ def home():
     </style>
 </head>
 <body>
+    """ + nav + """
     <div class="container">
         <header>
-            <h1>⚡ European Energy Market Dashboard</h1>
-            <p class="subtitle">Solar Capture Prices & Negative Price Hours • 2025</p>
+            <h1>enerlyzer</h1>
+            <p class="subtitle">European Energy Market Dashboard • Solar Capture Prices & Negative Hours • 2025</p>
         </header>
         
         <div class="controls">
@@ -463,11 +484,9 @@ def home():
                     sorted.map(x => x.capture_rate), sorted.map(x => x.solar_at_neg_price_pct)
                 ];
             } else {
-                // Single zone + single month -> fetch DAILY data
                 const dailyRes = await fetch(`/api/summary/daily?country=${encodeURIComponent(zone)}&month=${month}`);
                 const dailyData = (await dailyRes.json()).data;
                 
-                // Calculate totals for stat cards
                 d = {
                     neg_hours: dailyData.reduce((s,x) => s + x.neg_hours, 0),
                     avg_market_price: dailyData.length ? dailyData.reduce((s,x) => s + x.avg_market_price, 0) / dailyData.length : 0,
@@ -477,7 +496,6 @@ def home():
                     solar_at_neg_price_pct: dailyData.length ? dailyData.reduce((s,x) => s + x.solar_at_neg_price_pct, 0) / dailyData.length : 0
                 };
                 
-                // Daily labels (1, 2, 3, ... 31)
                 const sorted = dailyData.sort((a,b) => a.day - b.day);
                 labels = sorted.map(x => x.day.toString());
                 datasets = [
@@ -525,6 +543,285 @@ def home():
 """)
 
 
+@app.get("/about/project")
+def about_project():
+    styles = get_base_styles()
+    nav = get_nav_html('project')
+    return HTMLResponse(f"""
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>About the Project - enerlyzer</title>
+    <style>{styles}</style>
+</head>
+<body>
+    {nav}
+    <div class="page-content">
+        <header>
+            <h1>enerlyzer</h1>
+            <p class="subtitle">About the Project</p>
+        </header>
+        
+        <h2>What is enerlyzer?</h2>
+        <p>
+            enerlyzer is a comprehensive dashboard for analyzing the European energy market, 
+            with a focus on solar power economics. The platform tracks and visualizes key metrics 
+            across 47 European bidding zones, providing insights into market dynamics, 
+            negative pricing events, and renewable energy capture rates.
+        </p>
+        
+        <h2>Why This Matters</h2>
+        <p>
+            As Europe accelerates its transition to renewable energy, the dynamics of electricity 
+            markets are changing rapidly — especially with the rise of solar. New patterns are 
+            emerging and are reshaping how energy systems operate. Negative price hours, for example, 
+            highlight both the challenges and opportunities that come with a power system increasingly 
+            driven by weather-dependent generation.
+        </p>
+        <p>
+            This project aims to shed light on these evolving dynamics and make them easier to understand. 
+            Building the app also gave me the opportunity to explore energy datasets more deeply using 
+            SQL and Python and to experiment with ways of visualizing market behavior.
+        </p>
+        <p>
+            The work is ongoing, and I plan to expand the tool step by step with new features, 
+            more analytics, and additional market indicators.
+        </p>
+        <p>
+            This dashboard helps investors, researchers, and policymakers understand:
+        </p>
+        <ul style="color: var(--text-muted); margin-left: 2rem; line-height: 2;">
+            <li>Where and when negative pricing occurs</li>
+            <li>How solar generators are affected by market dynamics</li>
+            <li>The gap between average market prices and solar capture prices</li>
+            <li>Trends across different European markets</li>
+        </ul>
+        
+        <h2>Data Source</h2>
+        <p>
+            All data is sourced from the <strong>ENTSO-E Transparency Platform</strong>, 
+            the official source for European electricity market data. The dashboard updates 
+            daily with the latest market information.
+        </p>
+    </div>
+</body>
+</html>
+""")
+
+
+@app.get("/about/me")
+def about_me():
+    styles = get_base_styles()
+    nav = get_nav_html('about-me')
+    return HTMLResponse(f"""
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>About Me - enerlyzer</title>
+    <style>{styles}</style>
+</head>
+<body>
+    {nav}
+    <div class="page-content">
+        <header>
+            <h1>enerlyzer</h1>
+            <p class="subtitle">About Me</p>
+        </header>
+        
+        <div class="profile-section">
+            <img src="/static/250509_PGB9975_1.jpg" alt="Profile" class="profile-img" 
+                 onerror="this.src='https://via.placeholder.com/180?text=Photo'">
+            <div>
+                <h2 style="margin-top: 0;">Marian Willuhn</h2>
+                <p>
+                    Hi, I'm Marian Willuhn, an energy nerd with a background in political science 
+                    and international law, currently working as a journalist at the intersection of 
+                    electricity markets, regulation, and data. Over the past years, I've been exploring 
+                    how energy systems evolve: how prices form, where flexibility is needed, and which 
+                    role storage, grids, and digitalization play in the transition towards a renewable future.
+                </p>
+                <p>
+                    I have been exploring data-driven market and price analysis and have been building 
+                    tools that make public energy datasets more accessible. In doing so, I worked with 
+                    Python and SQL, and I developed APIs and data infrastructure to visualize trends 
+                    and uncover insights. This app is part of that journey — a way to turn raw electricity 
+                    market data into something transparent, interactive, and useful.
+                </p>
+                <p>
+                    My motivation is to turn complex energy topics into something everybody understands. 
+                    I enjoy breaking down technical or regulatory issues and turning them into clear 
+                    insights that help people grasp what is happening in the power system and why it matters.
+                </p>
+                <p>
+                    If you have ideas, want to collaborate, or need help with energy data analysis or 
+                    market research, feel free to reach out.
+                </p>
+            </div>
+        </div>
+        
+        <div class="social-links">
+            <a href="https://www.linkedin.com/in/marian-willuhn-0451b2a8/" target="_blank">
+                <svg viewBox="0 0 24 24" fill="currentColor">
+                    <path d="M20.447 20.452h-3.554v-5.569c0-1.328-.027-3.037-1.852-3.037-1.853 0-2.136 1.445-2.136 2.939v5.667H9.351V9h3.414v1.561h.046c.477-.9 1.637-1.85 3.37-1.85 3.601 0 4.267 2.37 4.267 5.455v6.286zM5.337 7.433c-1.144 0-2.063-.926-2.063-2.065 0-1.138.92-2.063 2.063-2.063 1.14 0 2.064.925 2.064 2.063 0 1.139-.925 2.065-2.064 2.065zm1.782 13.019H3.555V9h3.564v11.452zM22.225 0H1.771C.792 0 0 .774 0 1.729v20.542C0 23.227.792 24 1.771 24h20.451C23.2 24 24 23.227 24 22.271V1.729C24 .774 23.2 0 22.222 0h.003z"/>
+                </svg>
+                LinkedIn
+            </a>
+            <a href="https://github.com/Willyuhn" target="_blank">
+                <svg viewBox="0 0 24 24" fill="currentColor">
+                    <path d="M12 0c-6.626 0-12 5.373-12 12 0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23.957-.266 1.983-.399 3.003-.404 1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576 4.765-1.589 8.199-6.086 8.199-11.386 0-6.627-5.373-12-12-12z"/>
+                </svg>
+                GitHub
+            </a>
+            <a href="mailto:willuhn.marian@gmail.com">
+                <svg viewBox="0 0 24 24" fill="currentColor">
+                    <path d="M20 4H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2zm0 4l-8 5-8-5V6l8 5 8-5v2z"/>
+                </svg>
+                Email
+            </a>
+        </div>
+    </div>
+</body>
+</html>
+""")
+
+
+@app.get("/methodology")
+def methodology():
+    styles = get_base_styles()
+    nav = get_nav_html('methodology')
+    return HTMLResponse(f"""
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Methodology - enerlyzer</title>
+    <style>{styles}</style>
+</head>
+<body>
+    {nav}
+    <div class="page-content">
+        <header>
+            <h1>enerlyzer</h1>
+            <p class="subtitle">Methodology</p>
+        </header>
+        
+        <h2>How We Calculate the Metrics</h2>
+        
+        <div class="method-card">
+            <h3>Negative Price Hours</h3>
+            <p>Hours where the day-ahead electricity price falls below €0/MWh.</p>
+            <div class="formula">Neg Hours = Σ (hours where Price &lt; 0)</div>
+            <p>For 15-minute resolution data, each interval counts as 0.25 hours.</p>
+        </div>
+        
+        <div class="method-card">
+            <h3>Average Market Price</h3>
+            <p>The arithmetic mean of all day-ahead hourly prices in the selected period.</p>
+            <div class="formula">Avg Price = Σ(Price) / Count(Hours)</div>
+        </div>
+        
+        <div class="method-card">
+            <h3>Capture Price</h3>
+            <p>The volume-weighted average price received by solar generators.</p>
+            <div class="formula">Capture Price = Σ(Generation × Price) / Σ(Generation)</div>
+        </div>
+        
+        <div class="method-card">
+            <h3>Capture Price (Floor €0)</h3>
+            <p>Same as Capture Price, but negative prices are floored at €0.</p>
+            <div class="formula">Capture Floor = Σ(Generation × max(Price, 0)) / Σ(Generation)</div>
+        </div>
+        
+        <div class="method-card">
+            <h3>Capture Rate</h3>
+            <p>The ratio of Capture Price to Average Market Price.</p>
+            <div class="formula">Capture Rate = (Capture Price / Avg Market Price) × 100%</div>
+        </div>
+        
+        <div class="method-card">
+            <h3>Solar Volume at Negative Prices</h3>
+            <p>Percentage of solar generation during negative price hours.</p>
+            <div class="formula">Solar @ Neg = (Gen during neg hours / Total Gen) × 100%</div>
+        </div>
+    </div>
+</body>
+</html>
+""")
+
+
+@app.get("/contact")
+def contact():
+    styles = get_base_styles()
+    nav = get_nav_html('contact')
+    return HTMLResponse(f"""
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Contact - enerlyzer</title>
+    <style>{styles}</style>
+</head>
+<body>
+    {nav}
+    <div class="page-content">
+        <header>
+            <h1>enerlyzer</h1>
+            <p class="subtitle">Contact</p>
+        </header>
+        
+        <h2>Get in Touch</h2>
+        <p>
+            Have questions about the data, methodology, or interested in collaboration? 
+            Feel free to reach out through any of the channels below.
+        </p>
+        
+        <div class="social-links" style="justify-content: center; margin-top: 3rem;">
+            <a href="https://www.linkedin.com/in/marian-willuhn-0451b2a8/" target="_blank">
+                <svg viewBox="0 0 24 24" fill="currentColor">
+                    <path d="M20.447 20.452h-3.554v-5.569c0-1.328-.027-3.037-1.852-3.037-1.853 0-2.136 1.445-2.136 2.939v5.667H9.351V9h3.414v1.561h.046c.477-.9 1.637-1.85 3.37-1.85 3.601 0 4.267 2.37 4.267 5.455v6.286zM5.337 7.433c-1.144 0-2.063-.926-2.063-2.065 0-1.138.92-2.063 2.063-2.063 1.14 0 2.064.925 2.064 2.063 0 1.139-.925 2.065-2.064 2.065zm1.782 13.019H3.555V9h3.564v11.452zM22.225 0H1.771C.792 0 0 .774 0 1.729v20.542C0 23.227.792 24 1.771 24h20.451C23.2 24 24 23.227 24 22.271V1.729C24 .774 23.2 0 22.222 0h.003z"/>
+                </svg>
+                LinkedIn
+            </a>
+            <a href="https://github.com/Willyuhn" target="_blank">
+                <svg viewBox="0 0 24 24" fill="currentColor">
+                    <path d="M12 0c-6.626 0-12 5.373-12 12 0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23.957-.266 1.983-.399 3.003-.404 1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576 4.765-1.589 8.199-6.086 8.199-11.386 0-6.627-5.373-12-12-12z"/>
+                </svg>
+                GitHub
+            </a>
+            <a href="mailto:willuhn.marian@gmail.com">
+                <svg viewBox="0 0 24 24" fill="currentColor">
+                    <path d="M20 4H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2zm0 4l-8 5-8-5V6l8 5 8-5v2z"/>
+                </svg>
+                Email
+            </a>
+        </div>
+        
+        <div style="text-align: center; margin-top: 3rem; padding: 2rem; background: var(--bg-card); border-radius: 12px;">
+            <p style="margin-bottom: 0;">
+                <strong style="color: var(--cyan);">enerlyzer</strong> is an open-source project.<br>
+                Contributions and feedback are welcome!
+            </p>
+        </div>
+    </div>
+</body>
+</html>
+""")
+
+
+@app.get("/static/{filename}")
+def serve_static(filename: str):
+    static_path = os.path.join(os.path.dirname(__file__), "static", filename)
+    if os.path.exists(static_path):
+        return FileResponse(static_path)
+    return HTMLResponse("Not found", status_code=404)
+
+
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8080)
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
