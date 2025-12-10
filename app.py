@@ -40,6 +40,71 @@ def health_check():
         return {"status": "unhealthy", "error": str(e)}
 
 
+@app.post("/admin/update-summaries")
+def update_summaries(secret: str = ""):
+    """
+    Recalculate all summary tables.
+    Triggered by Cloud Scheduler at 6 AM daily.
+    Requires secret key for security.
+    """
+    # Simple security check
+    expected_secret = os.getenv("UPDATE_SECRET", "your-secret-key")
+    if secret != expected_secret:
+        return {"error": "Unauthorized"}, 401
+    
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        # Recalculate summary_monthly
+        cursor.execute("DELETE FROM summary_monthly")
+        cursor.execute("""
+            INSERT INTO summary_monthly (country, month, neg_hours, avg_market_price)
+            WITH prices_raw AS (
+                SELECT AreaDisplayName, `DateTime(UTC)`, ResolutionCode, `Price[Currency/MWh]`, source_month,
+                    SUM(CASE WHEN ResolutionCode = 'PT60M' THEN 1 ELSE 0 END) 
+                    OVER (PARTITION BY AreaDisplayName, `DateTime(UTC)`) AS cnt_60m_same_ts
+                FROM energy_prices
+                WHERE ContractType = 'Day-ahead' AND (`Sequence` IS NULL OR `Sequence` NOT IN ('2', '3'))
+            ),
+            prices_dedup AS (
+                SELECT * FROM prices_raw
+                WHERE ResolutionCode = 'PT60M' OR (ResolutionCode = 'PT15M' AND cnt_60m_same_ts = 0)
+            )
+            SELECT AreaDisplayName, source_month,
+                SUM(CASE WHEN ResolutionCode = 'PT60M' AND `Price[Currency/MWh]` < 0 THEN 1.0
+                         WHEN ResolutionCode = 'PT15M' AND `Price[Currency/MWh]` < 0 THEN 0.25 ELSE 0.0 END),
+                ROUND(AVG(`Price[Currency/MWh]`), 2)
+            FROM prices_dedup GROUP BY AreaDisplayName, source_month
+        """)
+        conn.commit()
+        
+        # Recalculate summary_yearly
+        cursor.execute("DELETE FROM summary_yearly")
+        cursor.execute("""
+            INSERT INTO summary_yearly (country, total_neg_hours, avg_market_price)
+            SELECT country, SUM(neg_hours), ROUND(AVG(avg_market_price), 2)
+            FROM summary_monthly GROUP BY country
+        """)
+        conn.commit()
+        
+        # Recalculate summary_total
+        cursor.execute("DELETE FROM summary_total")
+        cursor.execute("""
+            INSERT INTO summary_total (id, total_neg_hours, avg_market_price)
+            SELECT 1, SUM(total_neg_hours), ROUND(AVG(avg_market_price), 2)
+            FROM summary_yearly
+        """)
+        conn.commit()
+        
+        cursor.close()
+        conn.close()
+        
+        return {"status": "success", "message": "Summary tables updated"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
 @app.get("/api/summary/total")
 def get_summary_total():
     conn = get_db_connection()
