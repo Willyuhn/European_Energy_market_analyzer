@@ -17,6 +17,22 @@ DB_CONFIG = {
     'connection_timeout': 600,
 }
 
+def ensure_indexes(cursor, conn):
+    # For energy_prices: filter & join on (ContractType, source_month, AreaCode, DateTime(UTC))
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_ep_contract_month_area_dt 
+        ON energy_prices (ContractType, source_month, AreaCode, `DateTime(UTC)`);
+    """)
+    
+    # For generation_per_type: join on (AreaCode, source_month, DateTime(UTC)), filter by ProductionType
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_gp_area_month_dt_pt 
+        ON generation_per_type (AreaCode, source_month, `DateTime(UTC)`, ProductionType);
+    """)
+    
+    conn.commit()
+
+
 def main():
     print("=" * 60, flush=True)
     print("Creating Summary Tables with All Metrics", flush=True)
@@ -24,6 +40,9 @@ def main():
     
     conn = mysql.connector.connect(**DB_CONFIG)
     cursor = conn.cursor()
+          
+# Optional but recommended: make sure indexes exist
+    ensure_indexes(cursor, conn)
     
     # =========================================================
     # STEP 1: Create summary_monthly table with all columns
