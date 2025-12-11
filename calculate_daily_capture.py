@@ -180,17 +180,20 @@ def main():
         for month in months:
             task_num += 1
             
-            # Check if already processed (capture_price > 0)
-            cursor.execute("""
-                SELECT COUNT(*) FROM summary_daily 
-                WHERE country = %s AND month = %s AND capture_price > 0
-            """, (area_display_name, month))
-            already_done = cursor.fetchone()[0]
-            
-            if already_done > 0:
-                skipped += 1
-                print(f"[{task_num}/{total_tasks}] {area_display_name}, Month {month}... SKIPPED (already done)", flush=True)
-                continue
+            # Check if this country/month is already fully processed
+            # We only skip if there are NO rows with capture_price IS NULL
+    cursor.execute("""
+        SELECT COUNT(*) 
+        FROM summary_daily 
+        WHERE country = %s AND month = %s AND capture_price IS NULL
+    """, (area_display_name, month))
+    remaining_nulls = cursor.fetchone()[0]
+
+    if remaining_nulls == 0:
+        skipped += 1
+        print(f"[{task_num}/{total_tasks}] {area_display_name}, Month {month}... SKIPPED (already complete)", flush=True)
+        continue
+
             
             print(f"[{task_num}/{total_tasks}] {area_display_name}, Month {month}...", end=" ", flush=True)
             
