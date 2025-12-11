@@ -10,12 +10,13 @@ import mysql.connector
 
 app = FastAPI(title="European Energy Market Dashboard")
 
-# Database configuration (set via environment variables)
-DB_HOST = os.environ.get('DB_HOST', '35.187.43.229')
-DB_PORT = int(os.getenv('DB_PORT', '3306'))
-DB_USER = os.environ.get('DB_USER', 'root')
-DB_PASSWORD = os.environ.get('DB_PASSWORD', 'YourSecurePassword123!')
-DB_NAME = os.getenv('DB_NAME', 'energy_market')
+# Database configuration (set via environment variables in Cloud Run)
+# These must be set as environment variables - no defaults for security
+DB_HOST = os.environ['DB_HOST']
+DB_PORT = int(os.environ.get('DB_PORT', '3306'))
+DB_USER = os.environ['DB_USER']
+DB_PASSWORD = os.environ['DB_PASSWORD']
+DB_NAME = os.environ.get('DB_NAME', 'energy_market')
 
 
 def get_db_connection():
@@ -421,9 +422,9 @@ def home():
             <div class="chart-card"><div class="chart-title">Capture Price Floor €0 (€/MWh)</div><div class="chart-container"><canvas id="chart4"></canvas></div></div>
             <div class="chart-card"><div class="chart-title">Capture Rate (%)</div><div class="chart-container"><canvas id="chart5"></canvas></div></div>
             <div class="chart-card"><div class="chart-title">Solar Volume @ Neg Price (%)</div><div class="chart-container"><canvas id="chart6"></canvas></div></div>
-        </div>
-    </div>
-    
+                </div>
+            </div>
+            
     <script>
         let yearlyData = [], monthlyData = [], totalData = {};
         let charts = {};
@@ -519,7 +520,7 @@ def home():
             const opts = {
                 responsive: true, maintainAspectRatio: false,
                 plugins: { legend: { display: false } },
-                scales: {
+                    scales: {
                     x: { ticks: { color: '#8892a0', maxRotation: 45 }, grid: { color: '#2a3a4d' } },
                     y: { ticks: { color: '#8892a0' }, grid: { color: '#2a3a4d' } }
                 }
@@ -527,7 +528,7 @@ def home():
             for (let i = 0; i < 6; i++) {
                 if (charts[i]) charts[i].destroy();
                 charts[i] = new Chart(document.getElementById('chart' + (i+1)), {
-                    type: 'bar',
+                type: 'bar',
                     data: { labels, datasets: [{ data: datasets[i], backgroundColor: COLORS[i] + '99', borderColor: COLORS[i], borderWidth: 1 }] },
                     options: opts
                 });
