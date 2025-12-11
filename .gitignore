@@ -1,8 +1,0 @@
-__pycache__/
-*.py[cod]
-*.csv
-Energy Prices/
-Generation_per_type_new/
-.env
-*.env
-.DS_Store
