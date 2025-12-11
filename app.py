@@ -10,14 +10,13 @@ import mysql.connector
 
 app = FastAPI(title="European Energy Market Dashboard")
 
-# Database configuration (set via environment variables)
-# For local dev, define these in your .env / run config.
-DB_HOST = os.environ["DB_HOST"]
-DB_PORT = int(os.getenv("DB_PORT", "3306"))
-DB_USER = os.environ["DB_USER"]
-DB_PASSWORD = os.environ["DB_PASSWORD"]
-DB_NAME = os.environ["DB_NAME"]
-
+# Database configuration (set via environment variables in Cloud Run)
+# These must be set as environment variables - no defaults for security
+DB_HOST = os.environ['DB_HOST']
+DB_PORT = int(os.environ.get('DB_PORT', '3306'))
+DB_USER = os.environ['DB_USER']
+DB_PASSWORD = os.environ['DB_PASSWORD']
+DB_NAME = os.environ.get('DB_NAME', 'energy_market')
 
 
 def get_db_connection():
@@ -46,30 +45,6 @@ def get_summary_total():
                capture_price_floor0, capture_rate, solar_at_neg_price_pct 
         FROM summary_total WHERE id = 1
     """)
-    row = cursor.fetchone()
-    cursor.close()
-    conn.close()
-    
-    if row is None:
-        # Graceful fallback if summary_total is empty or not yet created
-        return {
-            "neg_hours": 0.0,
-            "avg_market_price": 0.0,
-            "capture_price": 0.0,
-            "capture_price_floor0": 0.0,
-            "capture_rate": 0.0,
-            "solar_at_neg_price_pct": 0.0,
-        }
-    
-    return {
-        "neg_hours": float(row[0] or 0),
-        "avg_market_price": float(row[1] or 0),
-        "capture_price": float(row[2] or 0),
-        "capture_price_floor0": float(row[3] or 0),
-        "capture_rate": float(row[4] or 0),
-        "solar_at_neg_price_pct": float(row[5] or 0),
-    }
-
     row = cursor.fetchone()
     cursor.close()
     conn.close()
@@ -447,9 +422,9 @@ def home():
             <div class="chart-card"><div class="chart-title">Capture Price Floor €0 (€/MWh)</div><div class="chart-container"><canvas id="chart4"></canvas></div></div>
             <div class="chart-card"><div class="chart-title">Capture Rate (%)</div><div class="chart-container"><canvas id="chart5"></canvas></div></div>
             <div class="chart-card"><div class="chart-title">Solar Volume @ Neg Price (%)</div><div class="chart-container"><canvas id="chart6"></canvas></div></div>
-        </div>
-    </div>
-    
+                </div>
+            </div>
+            
     <script>
         let yearlyData = [], monthlyData = [], totalData = {};
         let charts = {};
@@ -545,7 +520,7 @@ def home():
             const opts = {
                 responsive: true, maintainAspectRatio: false,
                 plugins: { legend: { display: false } },
-                scales: {
+                    scales: {
                     x: { ticks: { color: '#8892a0', maxRotation: 45 }, grid: { color: '#2a3a4d' } },
                     y: { ticks: { color: '#8892a0' }, grid: { color: '#2a3a4d' } }
                 }
@@ -553,7 +528,7 @@ def home():
             for (let i = 0; i < 6; i++) {
                 if (charts[i]) charts[i].destroy();
                 charts[i] = new Chart(document.getElementById('chart' + (i+1)), {
-                    type: 'bar',
+                type: 'bar',
                     data: { labels, datasets: [{ data: datasets[i], backgroundColor: COLORS[i] + '99', borderColor: COLORS[i], borderWidth: 1 }] },
                     options: opts
                 });
