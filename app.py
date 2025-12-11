@@ -11,11 +11,13 @@ import mysql.connector
 app = FastAPI(title="European Energy Market Dashboard")
 
 # Database configuration (set via environment variables)
-DB_HOST = os.environ.get('DB_HOST', '35.187.43.229')
-DB_PORT = int(os.getenv('DB_PORT', '3306'))
-DB_USER = os.environ.get('DB_USER', 'root')
-DB_PASSWORD = os.environ.get('DB_PASSWORD', 'YourSecurePassword123!')
-DB_NAME = os.getenv('DB_NAME', 'energy_market')
+# For local dev, define these in your .env / run config.
+DB_HOST = os.environ["DB_HOST"]
+DB_PORT = int(os.getenv("DB_PORT", "3306"))
+DB_USER = os.environ["DB_USER"]
+DB_PASSWORD = os.environ["DB_PASSWORD"]
+DB_NAME = os.environ["DB_NAME"]
+
 
 
 def get_db_connection():
@@ -44,6 +46,30 @@ def get_summary_total():
                capture_price_floor0, capture_rate, solar_at_neg_price_pct 
         FROM summary_total WHERE id = 1
     """)
+    row = cursor.fetchone()
+    cursor.close()
+    conn.close()
+    
+    if row is None:
+        # Graceful fallback if summary_total is empty or not yet created
+        return {
+            "neg_hours": 0.0,
+            "avg_market_price": 0.0,
+            "capture_price": 0.0,
+            "capture_price_floor0": 0.0,
+            "capture_rate": 0.0,
+            "solar_at_neg_price_pct": 0.0,
+        }
+    
+    return {
+        "neg_hours": float(row[0] or 0),
+        "avg_market_price": float(row[1] or 0),
+        "capture_price": float(row[2] or 0),
+        "capture_price_floor0": float(row[3] or 0),
+        "capture_rate": float(row[4] or 0),
+        "solar_at_neg_price_pct": float(row[5] or 0),
+    }
+
     row = cursor.fetchone()
     cursor.close()
     conn.close()
