@@ -323,10 +323,10 @@ def recalculate_summaries():
 # =============================================================================
 
 def daily_update():
-    """Fetch last 3 days to catch any delays"""
-    print("\n📅 Daily Update: Fetching last 3 days")
+    """Fetch last 31 days to catch any delays"""
+    print("\n📅 Daily Update: Fetching last 31 days")
     end_date = datetime.utcnow()
-    start_date = end_date - timedelta(days=3)
+    start_date = end_date - timedelta(days=31)
     
     total_prices = 0
     total_gen = 0
