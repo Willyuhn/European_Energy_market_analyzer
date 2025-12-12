@@ -23,27 +23,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application code
 COPY app.py .
 
-# Copy scripts folder (for daily update functionality)
+# Copy scripts and static assets
 COPY scripts/ ./scripts/
-
-# Copy static folder (for profile picture and other assets)
-# Copy the entire static directory and its contents
-COPY static ./static/
-
-# Verify static files were copied (fail build if missing)
-# This will show in build logs and fail if file is missing
-RUN echo "=== VERIFYING STATIC FILES ===" && \
-    echo "Current directory:" && pwd && \
-    echo "Contents of static folder:" && \
-    ls -la ./static/ 2>&1 && \
-    echo "File count:" && \
-    find ./static -type f | wc -l && \
-    echo "Checking for profile image..." && \
-    (test -f ./static/250509_PGB9975_1.jpg && echo "✓ Profile image found!") || \
-    (echo "✗ ERROR: Profile image NOT found!" && \
-     echo "Files in static directory:" && \
-     find ./static -type f && \
-     exit 1)
+COPY static/ ./static/
 
 # Expose port (Cloud Run uses PORT env variable)
 EXPOSE 8080
