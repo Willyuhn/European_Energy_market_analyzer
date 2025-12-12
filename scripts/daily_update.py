@@ -273,6 +273,17 @@ def recalculate_summaries():
     print("\n🔄 Recalculating summary tables...")
     conn = get_db_connection()
     cursor = conn.cursor()
+
+    # Backfill daily capture_rate if price fields exist
+    cursor.execute("""
+        UPDATE summary_daily
+        SET capture_rate = ROUND(capture_price / NULLIF(avg_market_price, 0) * 100, 2)
+        WHERE (capture_rate IS NULL OR capture_rate = 0)
+          AND avg_market_price IS NOT NULL
+          AND avg_market_price <> 0
+    """)
+    conn.commit()
+    print(f"   ✅ Daily backfill capture_rate: {cursor.rowcount} rows")
     
     # Rebuild monthly from daily
     cursor.execute('DELETE FROM summary_monthly')
@@ -288,6 +299,17 @@ def recalculate_summaries():
     ''')
     conn.commit()
     print(f"   ✅ Monthly: {cursor.rowcount} rows")
+
+    # Backfill monthly capture_rate if missing
+    cursor.execute("""
+        UPDATE summary_monthly
+        SET capture_rate = ROUND(capture_price / NULLIF(avg_market_price, 0) * 100, 2)
+        WHERE (capture_rate IS NULL OR capture_rate = 0)
+          AND avg_market_price IS NOT NULL
+          AND avg_market_price <> 0
+    """)
+    conn.commit()
+    print(f"   ✅ Monthly backfill capture_rate: {cursor.rowcount} rows")
     
     # Rebuild yearly
     cursor.execute('DELETE FROM summary_yearly')
@@ -301,6 +323,17 @@ def recalculate_summaries():
     ''')
     conn.commit()
     print(f"   ✅ Yearly: {cursor.rowcount} rows")
+
+    # Backfill yearly capture_rate if missing
+    cursor.execute("""
+        UPDATE summary_yearly
+        SET capture_rate = ROUND(capture_price / NULLIF(avg_market_price, 0) * 100, 2)
+        WHERE (capture_rate IS NULL OR capture_rate = 0)
+          AND avg_market_price IS NOT NULL
+          AND avg_market_price <> 0
+    """)
+    conn.commit()
+    print(f"   ✅ Yearly backfill capture_rate: {cursor.rowcount} rows")
     
     # Rebuild total
     cursor.execute('DELETE FROM summary_total')
