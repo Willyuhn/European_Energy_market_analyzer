@@ -28,7 +28,7 @@ COPY scripts/ ./scripts/
 
 # Copy static folder (for profile picture and other assets)
 # Copy the entire static directory and its contents
-COPY static ./static
+COPY static ./static/
 
 # Verify static files were copied (fail build if missing)
 # This will show in build logs and fail if file is missing
