@@ -303,9 +303,6 @@ def daily_update():
     
     print(f"\n   Total: {total_prices} price records, {total_gen} generation records")
 
-rebuild_summary_daily(start_date, end_date)
-recalculate_summaries()
-
 # =============================================================================
 # MAIN
 # =============================================================================
