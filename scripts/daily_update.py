@@ -276,12 +276,6 @@ def rebuild_summary_daily(start_date, end_date):
     print("\n Rebuilding summary_daily (last 31 days)...")
     conn = get_db_connection()
     cursor = conn.cursor()
-
-    # Delete only affected days (not the whole table)
-    cursor.execute("""
-        DELETE FROM summary_daily
-        WHERE `DateTime(UTC)` IS NULL
-    """) 
     
     # Delete rows in the date window:
     cursor.execute("""
@@ -445,9 +439,9 @@ def daily_update():
         time.sleep(0.3)  # Rate limiting
     
     print(f"\n   Total: {total_prices} price records, {total_gen} generation records")
-    
-    # Recalculate summaries
-    recalculate_summaries()
+
+rebuild_summary_daily(start_date, end_date)
+recalculate_summaries()
 
 # =============================================================================
 # MAIN
