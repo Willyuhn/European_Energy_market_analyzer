@@ -16,13 +16,13 @@ sys.stdout.reconfigure(line_buffering=True)
 
 # Database configuration
 DB_CONFIG = {
-    'host': '35.187.43.229',
-    'port': 3306,
-    'user': 'root',
-    'password': 'YourSecurePassword123!',
-    'database': 'energy_market',
-    'use_pure': True,
-    'connection_timeout': 300,
+    "host": os.environ["DB_HOST"],
+    "port": int(os.environ.get("DB_PORT", "3306")),
+    "user": os.environ["DB_USER"],
+    "password": os.environ["DB_PASSWORD"],
+    "database": os.environ.get("DB_NAME", "energy_market"),
+    "use_pure": True,
+    "connection_timeout": 300,
     'autocommit': False,
 }
 
