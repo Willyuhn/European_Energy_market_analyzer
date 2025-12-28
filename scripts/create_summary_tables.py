@@ -4,7 +4,9 @@ Includes: neg_hours, avg_market_price, capture_price, capture_price_floor0,
           capture_rate, solar_at_neg_price_pct
 """
 import os
+from datetime import datetime
 import mysql.connector
+
 
 DB_CONFIG = {
     "host": os.environ["DB_HOST"],
@@ -23,6 +25,21 @@ def main():
     
     conn = mysql.connector.connect(**DB_CONFIG)
     cursor = conn.cursor()
+print("✅ Connected", flush=True)
+print("DB_HOST:", DB_CONFIG["host"], flush=True)
+print("DB_NAME:", DB_CONFIG["database"], flush=True)
+
+cursor.execute("SELECT CURRENT_USER(), DATABASE(), @@hostname, @@port, NOW()")
+print("Server:", cursor.fetchone(), flush=True)
+
+cursor.execute("SELECT COUNT(*) FROM energy_prices")
+print("energy_prices rows:", cursor.fetchone()[0], flush=True)
+
+cursor.execute("SELECT COUNT(*) FROM generation_per_type WHERE ProductionType='Solar'")
+print("generation_per_type Solar rows:", cursor.fetchone()[0], flush=True)
+
+print("Build started at UTC:", datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"), flush=True)
+
     
     # =========================================================
     # STEP 1: Create summary_monthly table with all columns
