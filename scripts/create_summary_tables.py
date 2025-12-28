@@ -3,7 +3,7 @@ Create summary tables for instant dashboard loading
 Includes: neg_hours, avg_market_price, capture_price, capture_price_floor0, 
           capture_rate, solar_at_neg_price_pct
 """
-
+import os
 import mysql.connector
 
 DB_CONFIG = {
