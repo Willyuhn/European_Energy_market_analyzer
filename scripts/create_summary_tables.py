@@ -22,9 +22,10 @@ def main():
     print("=" * 60, flush=True)
     print("Creating Summary Tables with All Metrics", flush=True)
     print("=" * 60, flush=True)
-    
+
     conn = mysql.connector.connect(**DB_CONFIG)
     cursor = conn.cursor()
+
     print("✅ Connected", flush=True)
     print("DB_HOST:", DB_CONFIG["host"], flush=True)
     print("DB_NAME:", DB_CONFIG["database"], flush=True)
@@ -35,35 +36,42 @@ def main():
     cursor.execute("SELECT COUNT(*) FROM energy_prices")
     print("energy_prices rows:", cursor.fetchone()[0], flush=True)
 
-    cursor.execute("SELECT COUNT(*) FROM generation_per_type WHERE ProductionType='Solar'")
+    cursor.execute(
+        "SELECT COUNT(*) FROM generation_per_type WHERE ProductionType='Solar'"
+    )
     print("generation_per_type Solar rows:", cursor.fetchone()[0], flush=True)
 
-    print("Build started at UTC:", datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"), flush=True)
+    print(
+        "Build started at UTC:",
+        datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+        flush=True,
+    )
 
-    
     # =========================================================
-    # STEP 1: Create summary_monthly table with all columns
+    # STEP 1: Create summary_monthly table
     # =========================================================
     print("\n1. Creating summary_monthly table structure...", flush=True)
+
     cursor.execute("DROP TABLE IF EXISTS summary_monthly")
-    cursor.execute("""
-        CREATE TABLE summary_monthly (
-            id INT AUTO_INCREMENT PRIMARY KEY,
-            country VARCHAR(100) NOT NULL,
-            month TINYINT NOT NULL,
-            neg_hours DECIMAL(10,2) DEFAULT 0,
-            avg_market_price DECIMAL(10,2) DEFAULT 0,
-            capture_price DECIMAL(10,2) DEFAULT 0,
-            capture_price_floor0 DECIMAL(10,2) DEFAULT 0,
-            capture_rate DECIMAL(10,2) DEFAULT 0,
-            solar_at_neg_price_pct DECIMAL(10,2) DEFAULT 0,
-            UNIQUE KEY unique_country_month (country, month),
-            INDEX idx_country (country),
-            INDEX idx_month (month)
-        )
-    """)
+
+    create_sql = """
+    CREATE TABLE summary_monthly (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        country VARCHAR(100) NOT NULL,
+        month TINYINT NOT NULL,
+        neg_hours DECIMAL(10,2) DEFAULT 0,
+        avg_market_price DECIMAL(10,2) DEFAULT 0,
+        capture_price DECIMAL(10,2) DEFAULT 0,
+        capture_price_floor0 DECIMAL(10,2) DEFAULT 0,
+        capture_rate DECIMAL(10,2) DEFAULT 0,
+        solar_at_neg_price_pct DECIMAL(10,2) DEFAULT 0,
+        UNIQUE KEY unique_country_month (country, month)
+    )
+    """
+
+    cursor.execute(create_sql)
     conn.commit()
-    print("   Done.", flush=True)
+
     
     # =========================================================
     # STEP 2: Calculate neg_hours and avg_market_price (from energy_prices only)
