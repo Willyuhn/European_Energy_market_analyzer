@@ -1,0 +1,15 @@
+# Dockerfile for Summary Tables Recalculation Job
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy the summary calculation script
+COPY create_summary_tables.py .
+
+# Run the script
+CMD ["python", "create_summary_tables.py"]
+
