@@ -335,7 +335,7 @@ def home():
     <div class="container">
         <header>
             <h1>enerlyzer</h1>
-            <p class="subtitle">European Energy Market Dashboard • Solar Capture Prices & Negative Hours • 2025</p>
+            <p class="subtitle">European Energy Market Dashboard • Solar Capture Prices & Negative Hours</p>
         </header>
         
         <div class="controls">
