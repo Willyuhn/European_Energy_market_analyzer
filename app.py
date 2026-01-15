@@ -6,16 +6,30 @@ Full featured with capture prices and summary tables
 import os
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, FileResponse
+from datetime import datetime
 import mysql.connector
+
+# Load environment variables from .env file if it exists (for local development)
+try:
+    env_file = os.path.join(os.path.dirname(__file__), '.env')
+    if os.path.exists(env_file):
+        with open(env_file, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith('#') and '=' in line:
+                    key, value = line.split('=', 1)
+                    os.environ.setdefault(key.strip(), value.strip())
+except (PermissionError, IOError):
+    pass  # Can't read .env file, will use environment variables or fail if not set
 
 app = FastAPI(title="European Energy Market Dashboard")
 
 # Database configuration (set via environment variables in Cloud Run)
 # These must be set as environment variables - no defaults for security
-DB_HOST = os.environ['DB_HOST']
+DB_HOST = os.environ.get('DB_HOST', '')
 DB_PORT = int(os.environ.get('DB_PORT', '3306'))
-DB_USER = os.environ['DB_USER']
-DB_PASSWORD = os.environ['DB_PASSWORD']
+DB_USER = os.environ.get('DB_USER', '')
+DB_PASSWORD = os.environ.get('DB_PASSWORD', '')
 DB_NAME = os.environ.get('DB_NAME', 'energy_market')
 
 
@@ -37,14 +51,26 @@ def health():
 
 
 @app.get("/api/summary/total")
-def get_summary_total():
+def get_summary_total(year: int = None):
+    """Get total summary, optionally filtered by year"""
+    if year is None:
+        year = datetime.now().year
+    
     conn = get_db_connection()
     cursor = conn.cursor()
+    
+    # Calculate totals from summary_monthly for the selected year
     cursor.execute("""
-        SELECT total_neg_hours, avg_market_price, capture_price, 
-               capture_price_floor0, capture_rate, solar_at_neg_price_pct 
-        FROM summary_total WHERE id = 1
-    """)
+        SELECT 
+            SUM(neg_hours) AS total_neg_hours,
+            ROUND(AVG(avg_market_price), 2) AS avg_market_price,
+            ROUND(AVG(capture_price), 2) AS capture_price,
+            ROUND(AVG(capture_price_floor0), 2) AS capture_price_floor0,
+            ROUND(AVG(capture_rate), 2) AS capture_rate,
+            ROUND(AVG(solar_at_neg_price_pct), 2) AS solar_at_neg_price_pct
+        FROM summary_monthly
+        WHERE year = %s
+    """, (year,))
     row = cursor.fetchone()
     cursor.close()
     conn.close()
@@ -60,14 +86,29 @@ def get_summary_total():
 
 
 @app.get("/api/summary/yearly")
-def get_summary_yearly():
+def get_summary_yearly(year: int = None):
+    """Get per-country summary, optionally filtered by year"""
+    if year is None:
+        year = datetime.now().year
+    
     conn = get_db_connection()
     cursor = conn.cursor()
+    
+    # Calculate per-country totals from summary_monthly for the selected year
     cursor.execute("""
-        SELECT country, total_neg_hours, avg_market_price, capture_price,
-               capture_price_floor0, capture_rate, solar_at_neg_price_pct
-        FROM summary_yearly ORDER BY country
-    """)
+        SELECT 
+            country,
+            SUM(neg_hours) AS total_neg_hours,
+            ROUND(AVG(avg_market_price), 2) AS avg_market_price,
+            ROUND(AVG(capture_price), 2) AS capture_price,
+            ROUND(AVG(capture_price_floor0), 2) AS capture_price_floor0,
+            ROUND(AVG(capture_rate), 2) AS capture_rate,
+            ROUND(AVG(solar_at_neg_price_pct), 2) AS solar_at_neg_price_pct
+        FROM summary_monthly
+        WHERE year = %s
+        GROUP BY country
+        ORDER BY country
+    """, (year,))
     results = cursor.fetchall()
     cursor.close()
     conn.close()
@@ -80,58 +121,168 @@ def get_summary_yearly():
     return {"data": data}
 
 
-@app.get("/api/summary/monthly")
-def get_summary_monthly():
+@app.get("/api/summary/years")
+def get_available_years():
+    """Get list of available years in the database"""
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("""
-        SELECT country, month, neg_hours, avg_market_price, capture_price,
-               capture_price_floor0, capture_rate, solar_at_neg_price_pct
-        FROM summary_monthly ORDER BY country, month
-    """)
-    results = cursor.fetchall()
+    years_set = set()
+    
+    # Try to get years from summary_monthly.year column
+    try:
+        cursor.execute("SELECT DISTINCT year FROM summary_monthly WHERE year IS NOT NULL")
+        for row in cursor.fetchall():
+            if row[0] is not None:
+                years_set.add(int(row[0]))
+    except mysql.connector.Error:
+        pass
+    
+    # Also try to get years from summary_daily.year column
+    try:
+        cursor.execute("SELECT DISTINCT year FROM summary_daily WHERE year IS NOT NULL")
+        for row in cursor.fetchall():
+            if row[0] is not None:
+                years_set.add(int(row[0]))
+    except mysql.connector.Error:
+        pass
+    
+    # If no years found in summary tables, extract from energy_prices
+    if not years_set:
+        try:
+            cursor.execute("""
+                SELECT DISTINCT YEAR(`DateTime(UTC)`) AS year 
+                FROM energy_prices 
+                WHERE `DateTime(UTC)` IS NOT NULL
+            """)
+            for row in cursor.fetchall():
+                if row[0] is not None:
+                    years_set.add(int(row[0]))
+        except mysql.connector.Error:
+            pass
+    
+    # If still no years, default to current year
+    if not years_set:
+        years_set.add(datetime.now().year)
+    
     cursor.close()
     conn.close()
+    years_list = sorted(years_set, reverse=True)
+    return {"years": years_list}
+
+
+@app.get("/api/summary/monthly")
+def get_summary_monthly(year: int = None):
+    """Get monthly summary data, optionally filtered by year"""
+    if year is None:
+        year = datetime.now().year
     
-    data = [{
-        "country": r[0], "month": r[1], "neg_hours": float(r[2] or 0), 
-        "avg_market_price": float(r[3] or 0), "capture_price": float(r[4] or 0),
-        "capture_price_floor0": float(r[5] or 0), "capture_rate": float(r[6] or 0),
-        "solar_at_neg_price_pct": float(r[7] or 0)
-    } for r in results]
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    # Check if year column exists
+    cursor.execute("SHOW COLUMNS FROM summary_monthly LIKE 'year'")
+    has_year_column = cursor.fetchone() is not None
+    
+    if has_year_column:
+        cursor.execute("""
+            SELECT country, month, year, neg_hours, avg_market_price, capture_price,
+                   capture_price_floor0, capture_rate, solar_at_neg_price_pct
+            FROM summary_monthly 
+            WHERE year = %s
+            ORDER BY country, month
+        """, (year,))
+        results = cursor.fetchall()
+        data = [{
+            "country": r[0], "month": r[1], "year": r[2], "neg_hours": float(r[3] or 0), 
+            "avg_market_price": float(r[4] or 0), "capture_price": float(r[5] or 0),
+            "capture_price_floor0": float(r[6] or 0), "capture_rate": float(r[7] or 0),
+            "solar_at_neg_price_pct": float(r[8] or 0)
+        } for r in results]
+    else:
+        # Fallback: no year column, return all data and assume current year
+        cursor.execute("""
+            SELECT country, month, neg_hours, avg_market_price, capture_price,
+                   capture_price_floor0, capture_rate, solar_at_neg_price_pct
+            FROM summary_monthly ORDER BY country, month
+        """)
+        results = cursor.fetchall()
+        data = [{
+            "country": r[0], "month": r[1], "year": year, "neg_hours": float(r[2] or 0), 
+            "avg_market_price": float(r[3] or 0), "capture_price": float(r[4] or 0),
+            "capture_price_floor0": float(r[5] or 0), "capture_rate": float(r[6] or 0),
+            "solar_at_neg_price_pct": float(r[7] or 0)
+        } for r in results]
+    
+    cursor.close()
+    conn.close()
     return {"data": data}
 
 
 @app.get("/api/summary/daily")
-def get_summary_daily(country: str = None, month: int = None):
+def get_summary_daily(country: str = None, month: int = None, year: int = None):
+    """Get daily summary data, optionally filtered by country, month, and year"""
+    if year is None:
+        year = datetime.now().year
+    
     conn = get_db_connection()
     cursor = conn.cursor()
     
-    if country and month:
-        cursor.execute("""
-            SELECT country, month, day, neg_hours, avg_market_price, capture_price,
-                   capture_price_floor0, capture_rate, solar_at_neg_price_pct
-            FROM summary_daily 
-            WHERE country = %s AND month = %s
-            ORDER BY day
-        """, (country, month))
-    else:
-        cursor.execute("""
-            SELECT country, month, day, neg_hours, avg_market_price, capture_price,
-                   capture_price_floor0, capture_rate, solar_at_neg_price_pct
-            FROM summary_daily ORDER BY country, month, day
-        """)
+    # Check if year column exists
+    cursor.execute("SHOW COLUMNS FROM summary_daily LIKE 'year'")
+    has_year_column = cursor.fetchone() is not None
     
-    results = cursor.fetchall()
+    if has_year_column:
+        if country and month:
+            cursor.execute("""
+                SELECT country, month, year, day, neg_hours, avg_market_price, capture_price,
+                       capture_price_floor0, capture_rate, solar_at_neg_price_pct
+                FROM summary_daily 
+                WHERE country = %s AND month = %s AND year = %s
+                ORDER BY day
+            """, (country, month, year))
+        else:
+            cursor.execute("""
+                SELECT country, month, year, day, neg_hours, avg_market_price, capture_price,
+                       capture_price_floor0, capture_rate, solar_at_neg_price_pct
+                FROM summary_daily 
+                WHERE year = %s
+                ORDER BY country, month, day
+            """, (year,))
+        
+        results = cursor.fetchall()
+        data = [{
+            "country": r[0], "month": r[1], "year": r[2], "day": r[3], "neg_hours": float(r[4] or 0), 
+            "avg_market_price": float(r[5] or 0), "capture_price": float(r[6] or 0),
+            "capture_price_floor0": float(r[7] or 0), "capture_rate": float(r[8] or 0),
+            "solar_at_neg_price_pct": float(r[9] or 0)
+        } for r in results]
+    else:
+        # Fallback: no year column, return all data and assume current year
+        if country and month:
+            cursor.execute("""
+                SELECT country, month, day, neg_hours, avg_market_price, capture_price,
+                       capture_price_floor0, capture_rate, solar_at_neg_price_pct
+                FROM summary_daily 
+                WHERE country = %s AND month = %s
+                ORDER BY day
+            """, (country, month))
+        else:
+            cursor.execute("""
+                SELECT country, month, day, neg_hours, avg_market_price, capture_price,
+                       capture_price_floor0, capture_rate, solar_at_neg_price_pct
+                FROM summary_daily ORDER BY country, month, day
+            """)
+        
+        results = cursor.fetchall()
+        data = [{
+            "country": r[0], "month": r[1], "year": year, "day": r[2], "neg_hours": float(r[3] or 0), 
+            "avg_market_price": float(r[4] or 0), "capture_price": float(r[5] or 0),
+            "capture_price_floor0": float(r[6] or 0), "capture_rate": float(r[7] or 0),
+            "solar_at_neg_price_pct": float(r[8] or 0)
+        } for r in results]
+    
     cursor.close()
     conn.close()
-    
-    data = [{
-        "country": r[0], "month": r[1], "day": r[2], "neg_hours": float(r[3] or 0), 
-        "avg_market_price": float(r[4] or 0), "capture_price": float(r[5] or 0),
-        "capture_price_floor0": float(r[6] or 0), "capture_rate": float(r[7] or 0),
-        "solar_at_neg_price_pct": float(r[8] or 0)
-    } for r in results]
     return {"data": data}
 
 
@@ -335,10 +486,16 @@ def home():
     <div class="container">
         <header>
             <h1>enerlyzer</h1>
-            <p class="subtitle">European Energy Market Dashboard • Solar Capture Prices & Negative Hours</p>
+            <p class="subtitle">European Energy Market Dashboard • Solar Capture Prices & Negative Hours - """ + str(datetime.now().year) + """</p>
         </header>
         
         <div class="controls">
+            <div class="control-group">
+                <label>Year</label>
+                <select id="yearSelect">
+                    <option value=""" + str(datetime.now().year) + """>""" + str(datetime.now().year) + """</option>
+                </select>
+            </div>
             <div class="control-group">
                 <label>Bidding Zone</label>
                 <select id="zoneSelect">
@@ -389,7 +546,7 @@ def home():
             <div class="control-group">
                 <label>Time Period</label>
                 <select id="monthSelect">
-                    <option value="all">Full Year 2025</option>
+                    <option value="all">Full Year</option>
                     <option value="1">January</option>
                     <option value="2">February</option>
                     <option value="3">March</option>
@@ -432,19 +589,71 @@ def home():
         const COLORS = ['#00f5d4','#f72585','#fee440','#ff6b35','#9d4edd','#4cc9f0'];
         
         async function loadData() {
+            // Load available years
+            try {
+                const yearsRes = await fetch('/api/summary/years');
+                if (!yearsRes.ok) {
+                    throw new Error('Failed to fetch years');
+                }
+                const yearsData = await yearsRes.json();
+                const yearSelect = document.getElementById('yearSelect');
+                yearSelect.innerHTML = '';
+                
+                if (yearsData.years && Array.isArray(yearsData.years) && yearsData.years.length > 0) {
+                    yearsData.years.forEach(year => {
+                        const option = document.createElement('option');
+                        option.value = year;
+                        option.textContent = year;
+                        if (year === """ + str(datetime.now().year) + """) {
+                            option.selected = true;
+                        }
+                        yearSelect.appendChild(option);
+                    });
+                } else {
+                    // Fallback: add current year if no years returned
+                    const option = document.createElement('option');
+                    option.value = """ + str(datetime.now().year) + """;
+                    option.textContent = """ + str(datetime.now().year) + """;
+                    option.selected = true;
+                    yearSelect.appendChild(option);
+                }
+            } catch (error) {
+                console.error('Error loading years:', error);
+                // Fallback: add current year on error
+                const yearSelect = document.getElementById('yearSelect');
+                yearSelect.innerHTML = '';
+                const option = document.createElement('option');
+                option.value = """ + str(datetime.now().year) + """;
+                option.textContent = """ + str(datetime.now().year) + """;
+                option.selected = true;
+                yearSelect.appendChild(option);
+            }
+            
+            const year = document.getElementById('yearSelect').value;
             const [t, y, m] = await Promise.all([
-                fetch('/api/summary/total').then(r => r.json()),
-                fetch('/api/summary/yearly').then(r => r.json()),
-                fetch('/api/summary/monthly').then(r => r.json())
+                fetch(`/api/summary/total?year=${year}`).then(r => r.json()),
+                fetch(`/api/summary/yearly?year=${year}`).then(r => r.json()),
+                fetch(`/api/summary/monthly?year=${year}`).then(r => r.json())
             ]);
             totalData = t; yearlyData = y.data; monthlyData = m.data;
             updateDisplay();
         }
         
         async function updateDisplay() {
+            const year = document.getElementById('yearSelect').value;
             const zone = document.getElementById('zoneSelect').value;
             const month = document.getElementById('monthSelect').value;
             let d, labels, datasets;
+            
+            // Reload all data for selected year
+            const [tRes, yRes, mRes] = await Promise.all([
+                fetch(`/api/summary/total?year=${year}`),
+                fetch(`/api/summary/yearly?year=${year}`),
+                fetch(`/api/summary/monthly?year=${year}`)
+            ]);
+            totalData = await tRes.json();
+            yearlyData = (await yRes.json()).data;
+            monthlyData = (await mRes.json()).data;
             
             if (zone === 'all' && month === 'all') {
                 d = totalData;
@@ -485,10 +694,21 @@ def home():
                     sorted.map(x => x.capture_rate), sorted.map(x => x.solar_at_neg_price_pct)
                 ];
             } else {
-                const dailyRes = await fetch(`/api/summary/daily?country=${encodeURIComponent(zone)}&month=${month}`);
+                // Specific zone + specific month: use monthly data for header (correct generation-weighted values)
+                // but daily data for charts
+                const dailyRes = await fetch(`/api/summary/daily?country=${encodeURIComponent(zone)}&month=${month}&year=${year}`);
                 const dailyData = (await dailyRes.json()).data;
                 
-                d = {
+                // Get the correct monthly value for this zone/month (generation-weighted)
+                const md = monthlyData.find(x => x.country === zone && x.month === parseInt(month));
+                d = md ? {
+                    neg_hours: md.neg_hours || 0,
+                    avg_market_price: md.avg_market_price || 0,
+                    capture_price: md.capture_price || 0,
+                    capture_price_floor0: md.capture_price_floor0 || 0,
+                    capture_rate: md.capture_rate || 0,
+                    solar_at_neg_price_pct: md.solar_at_neg_price_pct || 0
+                } : {
                     neg_hours: dailyData.reduce((s,x) => s + x.neg_hours, 0),
                     avg_market_price: dailyData.length ? dailyData.reduce((s,x) => s + x.avg_market_price, 0) / dailyData.length : 0,
                     capture_price: dailyData.length ? dailyData.reduce((s,x) => s + x.capture_price, 0) / dailyData.length : 0,
@@ -535,6 +755,7 @@ def home():
             }
         }
         
+        document.getElementById('yearSelect').addEventListener('change', updateDisplay);
         document.getElementById('zoneSelect').addEventListener('change', updateDisplay);
         document.getElementById('monthSelect').addEventListener('change', updateDisplay);
         loadData();
