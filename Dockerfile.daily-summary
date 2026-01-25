@@ -1,6 +1,13 @@
 FROM python:3.11-slim
+
 WORKDIR /app
+
+# Install MySQL client and Python dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy script
 COPY scripts/daily_summary_update.py .
+
+# Run the script
 CMD ["python", "daily_summary_update.py"]
