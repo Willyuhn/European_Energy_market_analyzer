@@ -1,9 +1,5 @@
 steps:
-  # Build the container image
   - name: 'gcr.io/cloud-builders/docker'
-    args: ['build', '-f', 'Dockerfile.summary', '-t', 'gcr.io/$PROJECT_ID/recalculate-summaries', '.']
-
-# Push the container image to Container Registry
+    args: ['build', '--no-cache', '-f', 'Dockerfile.daily-summary', '-t', 'gcr.io/$PROJECT_ID/daily-summary-update:v2', '.']
 images:
-  - 'gcr.io/$PROJECT_ID/recalculate-summaries'
-
+  - 'gcr.io/$PROJECT_ID/daily-summary-update:v2'
