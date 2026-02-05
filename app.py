@@ -1071,12 +1071,13 @@ def home():
                             label: 'Price (€/MWh)',
                             data: prices,
                             borderColor: '#4cc9f0',
-                            backgroundColor: 'rgba(76, 201, 240, 0.4)',
+                            backgroundColor: 'rgba(76, 201, 240, 0.3)',
                             fill: true,
                             yAxisID: 'y',
-                            tension: 0.4,
-                            pointRadius: 2,
-                            pointHoverRadius: 4
+                            stepped: 'before',
+                            pointRadius: 0,
+                            pointHoverRadius: 4,
+                            borderWidth: 2
                         },
                         {
                             label: 'Negative Price Periods',
@@ -1085,20 +1086,21 @@ def home():
                             backgroundColor: 'rgba(247, 37, 133, 0.5)',
                             fill: true,
                             yAxisID: 'y',
-                            tension: 0.4,
+                            stepped: 'before',
                             pointRadius: 0,
-                            borderDash: [5, 5]
+                            borderWidth: 2
                         },
                         {
                             label: 'Solar Generation (MW)',
                             data: solar,
                             borderColor: '#fee440',
-                            backgroundColor: 'rgba(254, 228, 64, 0.5)',
+                            backgroundColor: 'rgba(254, 228, 64, 0.4)',
                             fill: true,
                             yAxisID: 'y1',
-                            tension: 0.4,
-                            pointRadius: 2,
-                            pointHoverRadius: 4
+                            tension: 0.3,
+                            pointRadius: 0,
+                            pointHoverRadius: 4,
+                            borderWidth: 2
                         }
                     ]
                 },
