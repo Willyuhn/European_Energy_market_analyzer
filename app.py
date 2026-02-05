@@ -275,19 +275,42 @@ def get_hourly_day_data(country: str, month: int, day: int, year: int):
     cursor.close()
     conn.close()
     
-    # Convert to dictionaries with timestamps
-    prices = {str(row[0]): float(row[1] or 0) for row in price_data}
-    solar = {str(row[0]): float(row[1] or 0) for row in solar_data}
+    # Convert price data to list sorted by time
+    # Each entry: (datetime, price)
+    price_list = [(row[0], float(row[1] or 0)) for row in price_data]
+    price_list.sort(key=lambda x: x[0])
     
-    # Get all unique timestamps and merge data
-    all_timestamps = sorted(set(list(prices.keys()) + list(solar.keys())))
+    # Convert solar data to dict for lookup
+    solar = {}
+    for row in solar_data:
+        ts_str = str(row[0])[:19]  # YYYY-MM-DD HH:MM:SS
+        solar[ts_str] = float(row[1] or 0)
     
+    # Get all unique timestamps from solar data
+    all_timestamps = sorted(solar.keys())
+    
+    # If no solar data, use price timestamps
+    if not all_timestamps:
+        all_timestamps = [str(p[0])[:19] for p in price_list]
+    
+    # Build result with fill-forward prices
     result = []
-    for ts in all_timestamps:
+    price_idx = 0
+    current_price = price_list[0][1] if price_list else 0
+    
+    for ts_str in all_timestamps:
+        # Parse timestamp for comparison
+        ts_dt = datetime.strptime(ts_str, '%Y-%m-%d %H:%M:%S')
+        
+        # Find the applicable price (last price <= this timestamp)
+        while price_idx < len(price_list) and price_list[price_idx][0] <= ts_dt:
+            current_price = price_list[price_idx][1]
+            price_idx += 1
+        
         result.append({
-            "timestamp": ts,
-            "price": prices.get(ts, 0),
-            "solar_mw": solar.get(ts, 0)
+            "timestamp": ts_str,
+            "price": current_price,
+            "solar_mw": solar.get(ts_str, 0)
         })
     
     return {"data": result, "country": country, "date": date_str}
@@ -386,9 +409,9 @@ def get_base_styles():
             min-height: 100vh;
         }
         .container { 
-            max-width: 1600px; 
+            max-width: 95vw; 
             margin: 0 auto; 
-            padding: 2rem; 
+            padding: 1.5rem 2rem; 
             width: 100%;
             overflow-x: hidden;
         }
@@ -437,7 +460,7 @@ def get_base_styles():
         .dropdown:hover .dropdown-content { display: block; }
         .dropdown-content a { display: block; padding: 0.5rem 1rem; }
         
-        header { text-align: center; margin-bottom: 2rem; padding-top: 1rem; }
+        header { text-align: center; margin-bottom: 1.5rem; padding-top: 0.75rem; }
         h1 {
             font-size: 2.5rem;
             background: linear-gradient(135deg, var(--cyan), var(--pink));
@@ -505,7 +528,7 @@ def home():
             display: flex;
             gap: 1.5rem;
             justify-content: center;
-            margin-bottom: 2rem;
+            margin-bottom: 1.25rem;
             flex-wrap: wrap;
         }
         .control-group { display: flex; flex-direction: column; gap: 0.5rem; }
@@ -525,7 +548,7 @@ def home():
             display: grid;
             grid-template-columns: repeat(6, 1fr);
             gap: 1rem;
-            margin-bottom: 2rem;
+            margin-bottom: 1.25rem;
         }
         @media (max-width: 1200px) { .stats { grid-template-columns: repeat(3, 1fr); } }
         @media (max-width: 768px) { .stats { grid-template-columns: repeat(2, 1fr); } }
@@ -551,42 +574,33 @@ def home():
         .charts {
             display: grid;
             grid-template-columns: repeat(3, 1fr);
-            gap: 1.5rem;
-            /* Ensure grid items don't overflow */
+            gap: 1.25rem;
             min-width: 0;
         }
-        @media (max-width: 1400px) { .charts { grid-template-columns: repeat(2, 1fr); } }
+        @media (max-width: 1200px) { .charts { grid-template-columns: repeat(2, 1fr); } }
         @media (max-width: 768px) { .charts { grid-template-columns: 1fr; } }
         .chart-card {
             background: var(--bg-card);
             border-radius: 12px;
-            padding: 1.5rem;
-            /* Ensure chart-card doesn't expand */
+            padding: 1rem 1.25rem;
             min-width: 0;
             overflow: hidden;
         }
-        .chart-title { font-size: 0.9rem; margin-bottom: 0.75rem; color: var(--text-muted); }
+        .chart-title { font-size: 0.85rem; margin-bottom: 0.5rem; color: var(--text-muted); }
         .chart-container { 
-            height: 250px; 
-            width: 100% !important;
-            min-width: 300px;
-            max-width: 100% !important;
-            overflow-x: scroll !important;
-            overflow-y: hidden !important;
+            height: 220px; 
+            width: 100%;
+            min-width: 0;
+            max-width: 100%;
+            overflow-x: hidden;
+            overflow-y: hidden;
             position: relative;
             box-sizing: border-box;
-            /* Prevent container from expanding beyond its parent */
             display: block;
-            /* Force container to stay within bounds */
-            min-width: 0;
         }
         .chart-container canvas {
             display: block;
-            /* Prevent canvas from affecting container width */
             flex-shrink: 0;
-            /* Canvas can be wider than container */
-            max-width: none !important;
-            min-width: fit-content;
             /* Ensure canvas doesn't force container to expand */
             position: relative;
         }
@@ -620,47 +634,50 @@ def home():
                 <label>Bidding Zone</label>
                 <select id="zoneSelect">
                     <option value="all">All Bidding Zones</option>
-                    <option value="Austria (AT)">Austria (AT)</option>
-                    <option value="Belgium (BE)">Belgium (BE)</option>
-                    <option value="Bulgaria (BG)">Bulgaria (BG)</option>
-                    <option value="Croatia (HR)">Croatia (HR)</option>
-                    <option value="Czech Republic (CZ)">Czech Republic (CZ)</option>
-                    <option value="DE-LU">DE-LU (Germany-Luxembourg)</option>
-                    <option value="DK1">DK1 (Denmark West)</option>
-                    <option value="DK2">DK2 (Denmark East)</option>
-                    <option value="Estonia (EE)">Estonia (EE)</option>
-                    <option value="Finland (FI)">Finland (FI)</option>
-                    <option value="France (FR)">France (FR)</option>
-                    <option value="Greece (GR)">Greece (GR)</option>
-                    <option value="Hungary (HU)">Hungary (HU)</option>
-                    <option value="IE(SEM)">Ireland (SEM)</option>
+                    <option value="AT">Austria (AT)</option>
+                    <option value="BE">Belgium (BE)</option>
+                    <option value="BG">Bulgaria (BG)</option>
+                    <option value="CH">Switzerland (CH)</option>
+                    <option value="CZ">Czech Republic (CZ)</option>
+                    <option value="DE-LU">Germany-Luxembourg (DE-LU)</option>
+                    <option value="DK1">Denmark West (DK1)</option>
+                    <option value="DK2">Denmark East (DK2)</option>
+                    <option value="EE">Estonia (EE)</option>
+                    <option value="ES">Spain (ES)</option>
+                    <option value="FI">Finland (FI)</option>
+                    <option value="FR">France (FR)</option>
+                    <option value="GR">Greece (GR)</option>
+                    <option value="HR">Croatia (HR)</option>
+                    <option value="HU">Hungary (HU)</option>
+                    <option value="IE-SEM">Ireland (IE-SEM)</option>
                     <option value="IT-Calabria">Italy - Calabria</option>
                     <option value="IT-Centre-North">Italy - Centre-North</option>
                     <option value="IT-Centre-South">Italy - Centre-South</option>
                     <option value="IT-North">Italy - North</option>
+                    <option value="IT-SACOAC">Italy - Sardinia AC</option>
+                    <option value="IT-SACODC">Italy - Sardinia DC</option>
                     <option value="IT-Sardinia">Italy - Sardinia</option>
                     <option value="IT-Sicily">Italy - Sicily</option>
-                    <option value="IT-South">Italy - South</option>
-                    <option value="Latvia (LV)">Latvia (LV)</option>
-                    <option value="Lithuania (LT)">Lithuania (LT)</option>
-                    <option value="Netherlands (NL)">Netherlands (NL)</option>
-                    <option value="NO1">NO1 (Norway South-East)</option>
-                    <option value="NO2">NO2 (Norway South-West)</option>
-                    <option value="NO3">NO3 (Norway Central)</option>
-                    <option value="NO4">NO4 (Norway North)</option>
-                    <option value="NO5">NO5 (Norway West)</option>
-                    <option value="Poland (PL)">Poland (PL)</option>
-                    <option value="Portugal (PT)">Portugal (PT)</option>
-                    <option value="Romania (RO)">Romania (RO)</option>
-                    <option value="SE1">SE1 (Sweden North)</option>
-                    <option value="SE2">SE2 (Sweden Central-North)</option>
-                    <option value="SE3">SE3 (Sweden Central-South)</option>
-                    <option value="SE4">SE4 (Sweden South)</option>
-                    <option value="Serbia (RS)">Serbia (RS)</option>
-                    <option value="Slovakia (SK)">Slovakia (SK)</option>
-                    <option value="Slovenia (SI)">Slovenia (SI)</option>
-                    <option value="Spain (ES)">Spain (ES)</option>
-                    <option value="Switzerland (CH)">Switzerland (CH)</option>
+                    <option value="LT">Lithuania (LT)</option>
+                    <option value="LV">Latvia (LV)</option>
+                    <option value="ME">Montenegro (ME)</option>
+                    <option value="MK">North Macedonia (MK)</option>
+                    <option value="NL">Netherlands (NL)</option>
+                    <option value="NO1">Norway South-East (NO1)</option>
+                    <option value="NO2">Norway South-West (NO2)</option>
+                    <option value="NO3">Norway Central (NO3)</option>
+                    <option value="NO4">Norway North (NO4)</option>
+                    <option value="NO5">Norway West (NO5)</option>
+                    <option value="PL">Poland (PL)</option>
+                    <option value="PT">Portugal (PT)</option>
+                    <option value="RO">Romania (RO)</option>
+                    <option value="RS">Serbia (RS)</option>
+                    <option value="SE1">Sweden North (SE1)</option>
+                    <option value="SE2">Sweden Central-North (SE2)</option>
+                    <option value="SE3">Sweden Central-South (SE3)</option>
+                    <option value="SE4">Sweden South (SE4)</option>
+                    <option value="SI">Slovenia (SI)</option>
+                    <option value="SK">Slovakia (SK)</option>
                 </select>
             </div>
             <div class="control-group">
@@ -726,6 +743,23 @@ def home():
         let charts = {};
         const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
         const COLORS = ['#00f5d4','#f72585','#fee440','#ff6b35','#9d4edd','#4cc9f0'];
+        const ZONE_NAMES = {
+            'AT': 'Austria', 'BE': 'Belgium', 'BG': 'Bulgaria', 'CH': 'Switzerland',
+            'CZ': 'Czechia', 'DE-LU': 'Germany', 'DK1': 'Denmark W', 'DK2': 'Denmark E',
+            'EE': 'Estonia', 'ES': 'Spain', 'FI': 'Finland', 'FR': 'France',
+            'GR': 'Greece', 'HR': 'Croatia', 'HU': 'Hungary', 'IE-SEM': 'Ireland',
+            'IT-Calabria': 'IT-Calabria', 'IT-Centre-North': 'IT-C-North', 
+            'IT-Centre-South': 'IT-C-South', 'IT-North': 'IT-North',
+            'IT-SACOAC': 'IT-Sard AC', 'IT-SACODC': 'IT-Sard DC',
+            'IT-Sardinia': 'IT-Sardinia', 'IT-Sicily': 'IT-Sicily',
+            'LT': 'Lithuania', 'LV': 'Latvia', 'ME': 'Montenegro', 'MK': 'N.Macedonia',
+            'NL': 'Netherlands', 'NO1': 'Norway SE', 'NO2': 'Norway SW', 
+            'NO3': 'Norway C', 'NO4': 'Norway N', 'NO5': 'Norway W',
+            'PL': 'Poland', 'PT': 'Portugal', 'RO': 'Romania', 'RS': 'Serbia',
+            'SE1': 'Sweden N', 'SE2': 'Sweden CN', 'SE3': 'Sweden CS', 'SE4': 'Sweden S',
+            'SI': 'Slovenia', 'SK': 'Slovakia'
+        };
+        const getZoneName = (code) => ZONE_NAMES[code] || code;
         
         async function loadData() {
             // Load available years and populate year selector
@@ -778,7 +812,7 @@ def home():
                 const sortedByCaptureRate = [...allData].sort((a,b) => b.capture_rate - a.capture_rate);
                 const sortedBySolarNeg = [...allData].sort((a,b) => b.solar_at_neg_price_pct - a.solar_at_neg_price_pct);
                 
-                labels = sortedByNegHours.map(x => x.country);
+                labels = sortedByNegHours.map(x => getZoneName(x.country));
                 datasets = [
                     sortedByNegHours.map(x => x.neg_hours),
                     sortedByAvgPrice.map(x => x.avg_market_price),
@@ -788,31 +822,29 @@ def home():
                     sortedBySolarNeg.map(x => x.solar_at_neg_price_pct)
                 ];
             } else if (zone !== 'all' && month === 'all') {
-                // Find zone in yearly data (generation-weighted stats)
-                const yd = yearlyData.find(x => x.country === zone);
-                if (yd) {
-                    d = { neg_hours: yd.neg_hours, avg_market_price: yd.avg_market_price,
-                          capture_price: yd.capture_price, capture_price_floor0: yd.capture_price_floor0,
-                          capture_rate: yd.capture_rate, solar_at_neg_price_pct: yd.solar_at_neg_price_pct };
-                } else {
-                    // Fallback to calculating from monthly data
-                    const md_stats = monthlyData.filter(x => x.country === zone && x.year === parseInt(year));
-                    d = {
-                        neg_hours: md_stats.reduce((s,x) => s + x.neg_hours, 0),
-                        avg_market_price: md_stats.length ? md_stats.reduce((s,x) => s + x.avg_market_price, 0) / md_stats.length : 0,
-                        capture_price: md_stats.length ? md_stats.reduce((s,x) => s + x.capture_price, 0) / md_stats.length : 0,
-                        capture_price_floor0: md_stats.length ? md_stats.reduce((s,x) => s + x.capture_price_floor0, 0) / md_stats.length : 0,
-                        capture_rate: md_stats.length ? md_stats.reduce((s,x) => s + x.capture_rate, 0) / md_stats.length : 0,
-                        solar_at_neg_price_pct: md_stats.length ? md_stats.reduce((s,x) => s + x.solar_at_neg_price_pct, 0) / md_stats.length : 0
-                    };
-                    console.warn('Zone not found in yearlyData:', zone, 'Available:', yearlyData.map(x => x.country));
-                }
-                const md = monthlyData.filter(x => x.country === zone && x.year === parseInt(year)).sort((a,b) => a.month - b.month);
-                labels = md.map(x => MONTHS[x.month - 1]);
+                // Calculate from monthly data for the selected year
+                const md_stats = monthlyData.filter(x => x.country === zone && x.year === parseInt(year));
+                d = {
+                    neg_hours: md_stats.reduce((s,x) => s + x.neg_hours, 0),
+                    avg_market_price: md_stats.length ? md_stats.reduce((s,x) => s + x.avg_market_price, 0) / md_stats.length : 0,
+                    capture_price: md_stats.length ? md_stats.reduce((s,x) => s + x.capture_price, 0) / md_stats.length : 0,
+                    capture_price_floor0: md_stats.length ? md_stats.reduce((s,x) => s + x.capture_price_floor0, 0) / md_stats.length : 0,
+                    capture_rate: md_stats.length ? md_stats.reduce((s,x) => s + x.capture_rate, 0) / md_stats.length : 0,
+                    solar_at_neg_price_pct: md_stats.length ? md_stats.reduce((s,x) => s + x.solar_at_neg_price_pct, 0) / md_stats.length : 0
+                };
+                // Always show 12 months, fill with null for missing data
+                const md = monthlyData.filter(x => x.country === zone && x.year === parseInt(year));
+                const mdByMonth = {};
+                md.forEach(x => { mdByMonth[x.month] = x; });
+                
+                labels = MONTHS;
                 datasets = [
-                    md.map(x => x.neg_hours), md.map(x => x.avg_market_price),
-                    md.map(x => x.capture_price), md.map(x => x.capture_price_floor0),
-                    md.map(x => x.capture_rate), md.map(x => x.solar_at_neg_price_pct)
+                    MONTHS.map((_, i) => mdByMonth[i+1] ? mdByMonth[i+1].neg_hours : null),
+                    MONTHS.map((_, i) => mdByMonth[i+1] ? mdByMonth[i+1].avg_market_price : null),
+                    MONTHS.map((_, i) => mdByMonth[i+1] ? mdByMonth[i+1].capture_price : null),
+                    MONTHS.map((_, i) => mdByMonth[i+1] ? mdByMonth[i+1].capture_price_floor0 : null),
+                    MONTHS.map((_, i) => mdByMonth[i+1] ? mdByMonth[i+1].capture_rate : null),
+                    MONTHS.map((_, i) => mdByMonth[i+1] ? mdByMonth[i+1].solar_at_neg_price_pct : null)
                 ];
             } else if (zone === 'all' && month !== 'all') {
                 const md = monthlyData.filter(x => x.month === parseInt(month) && x.year === parseInt(year));
@@ -832,7 +864,7 @@ def home():
                 const sortedByCaptureRate = [...md].sort((a,b) => b.capture_rate - a.capture_rate);
                 const sortedBySolarNeg = [...md].sort((a,b) => b.solar_at_neg_price_pct - a.solar_at_neg_price_pct);
                 
-                labels = sortedByNegHours.map(x => x.country);
+                labels = sortedByNegHours.map(x => getZoneName(x.country));
                 datasets = [
                     sortedByNegHours.map(x => x.neg_hours),
                     sortedByAvgPrice.map(x => x.avg_market_price),
@@ -884,25 +916,25 @@ def home():
                 
                 // Set canvas dimensions
                 canvas.width = canvasWidth;
-                canvas.height = 250;
+                canvas.height = 220;
                 canvas.style.width = canvasWidth + 'px';
-                canvas.style.height = '250px';
+                canvas.style.height = '220px';
                 canvas.style.display = 'block';
             });
         }
         
         function updateCharts(labels, datasets, zone, month, year) {
-            // Calculate minimum width based on number of bars (60px per bar minimum for readability)
-            const minWidth = Math.max(labels.length * 60, 1000);
+            // Only need scrolling when showing 40+ bars (all bidding zones)
+            const needsScrolling = labels.length >= 40;
             
             // Store current filter values for click handler
             const currentZone = zone;
             const currentMonth = month;
             const currentYear = year;
             
-            // Chart options
+            // Chart options - responsive when not scrolling
             const opts = {
-                responsive: false,
+                responsive: !needsScrolling,
                 maintainAspectRatio: false,
                 plugins: {
                     legend: { display: false }
@@ -923,35 +955,29 @@ def home():
                 if (charts[i]) charts[i].destroy();
                 
                 const canvas = document.getElementById('chart' + (i+1));
-                const container = canvas.parentElement; // This is the .chart-container div
-                const chartCard = container.parentElement;
+                const container = canvas.parentElement;
                 
-                // CRITICAL: Measure and lock container width BEFORE setting canvas size
-                // Force container to respect its parent's width
-                container.style.width = '100%';
-                container.style.maxWidth = '100%';
-                container.style.overflowX = 'scroll';
-                container.style.overflowY = 'hidden';
-                container.style.boxSizing = 'border-box';
+                // Reset all styles first
+                canvas.removeAttribute('width');
+                canvas.style.width = '';
+                canvas.style.minWidth = '';
+                canvas.style.maxWidth = '';
+                container.style.overflowX = '';
                 
-                // Force a reflow to ensure container width is calculated
-                void container.offsetWidth;
-                
-                // Now measure the container width (should be constrained to parent)
-                const containerWidth = container.clientWidth || container.offsetWidth || 400;
-                
-                // Canvas must be wider than container to trigger scrolling
-                const canvasWidth = Math.max(minWidth, containerWidth + 50);
-                
-                // Set canvas dimensions
-                canvas.width = canvasWidth;
-                canvas.height = 250;
-                canvas.style.width = canvasWidth + 'px';
-                canvas.style.height = '250px';
-                canvas.style.display = 'block';
-                canvas.style.maxWidth = 'none';
-                canvas.style.minWidth = canvasWidth + 'px';
-                canvas.style.boxSizing = 'content-box';
+                if (needsScrolling) {
+                    // Enable horizontal scrolling for 40+ bars
+                    container.style.overflowX = 'auto';
+                    
+                    const minWidth = labels.length * 45;
+                    canvas.style.width = minWidth + 'px';
+                    canvas.style.minWidth = minWidth + 'px';
+                    canvas.style.height = '220px';
+                } else {
+                    // No scrolling - responsive chart fits container
+                    container.style.overflowX = 'hidden';
+                    canvas.style.width = '100%';
+                    canvas.style.height = '220px';
+                }
                 
                 const chartConfig = {
                     type: 'bar',
@@ -960,31 +986,6 @@ def home():
                 };
                 
                 charts[i] = new Chart(canvas, chartConfig);
-                
-                // After chart creation, ensure container hasn't expanded and canvas is correct size
-                setTimeout(() => {
-                    // Re-measure to check if container expanded
-                    const newContainerWidth = container.clientWidth || container.offsetWidth;
-                    const newCardWidth = chartCard.offsetWidth || chartCard.clientWidth;
-                    
-                    // If container expanded beyond card, force it back
-                    if (newContainerWidth > newCardWidth * 1.1) {
-                        container.style.width = '100%';
-                        container.style.maxWidth = '100%';
-                    }
-                    
-                    // Ensure canvas is still wide enough
-                    const currentCanvasWidth = canvas.offsetWidth || parseInt(canvas.style.width) || 0;
-                    if (currentCanvasWidth < minWidth) {
-                        const finalCanvasWidth = Math.max(minWidth, newContainerWidth + 50);
-                        canvas.width = finalCanvasWidth;
-                        canvas.style.width = finalCanvasWidth + 'px';
-                        canvas.style.minWidth = finalCanvasWidth + 'px';
-                        if (charts[i]) {
-                            charts[i].resize();
-                        }
-                    }
-                }, 250);
                 
                 // Add click handler to chart6 (Solar Volume @ Neg Price) when viewing daily data
                 if (i === 5 && currentZone !== 'all' && currentMonth !== 'all') {
