@@ -822,16 +822,30 @@ def home():
                     sortedBySolarNeg.map(x => x.solar_at_neg_price_pct)
                 ];
             } else if (zone !== 'all' && month === 'all') {
-                // Calculate from monthly data for the selected year
-                const md_stats = monthlyData.filter(x => x.country === zone && x.year === parseInt(year));
-                d = {
-                    neg_hours: md_stats.reduce((s,x) => s + x.neg_hours, 0),
-                    avg_market_price: md_stats.length ? md_stats.reduce((s,x) => s + x.avg_market_price, 0) / md_stats.length : 0,
-                    capture_price: md_stats.length ? md_stats.reduce((s,x) => s + x.capture_price, 0) / md_stats.length : 0,
-                    capture_price_floor0: md_stats.length ? md_stats.reduce((s,x) => s + x.capture_price_floor0, 0) / md_stats.length : 0,
-                    capture_rate: md_stats.length ? md_stats.reduce((s,x) => s + x.capture_rate, 0) / md_stats.length : 0,
-                    solar_at_neg_price_pct: md_stats.length ? md_stats.reduce((s,x) => s + x.solar_at_neg_price_pct, 0) / md_stats.length : 0
-                };
+                // For 2025, use yearly data (properly calculated generation-weighted stats)
+                // For other years, calculate from monthly data as fallback
+                const yd = (parseInt(year) === 2025) ? yearlyData.find(x => x.country === zone) : null;
+                if (yd) {
+                    d = { 
+                        neg_hours: yd.neg_hours, 
+                        avg_market_price: yd.avg_market_price,
+                        capture_price: yd.capture_price, 
+                        capture_price_floor0: yd.capture_price_floor0,
+                        capture_rate: yd.capture_rate, 
+                        solar_at_neg_price_pct: yd.solar_at_neg_price_pct 
+                    };
+                } else {
+                    // Fallback: calculate from monthly data (for years without yearly summary)
+                    const md_stats = monthlyData.filter(x => x.country === zone && x.year === parseInt(year));
+                    d = {
+                        neg_hours: md_stats.reduce((s,x) => s + x.neg_hours, 0),
+                        avg_market_price: md_stats.length ? md_stats.reduce((s,x) => s + x.avg_market_price, 0) / md_stats.length : 0,
+                        capture_price: md_stats.length ? md_stats.reduce((s,x) => s + x.capture_price, 0) / md_stats.length : 0,
+                        capture_price_floor0: md_stats.length ? md_stats.reduce((s,x) => s + x.capture_price_floor0, 0) / md_stats.length : 0,
+                        capture_rate: md_stats.length ? md_stats.reduce((s,x) => s + x.capture_rate, 0) / md_stats.length : 0,
+                        solar_at_neg_price_pct: md_stats.length ? md_stats.reduce((s,x) => s + x.solar_at_neg_price_pct, 0) / md_stats.length : 0
+                    };
+                }
                 // Always show 12 months, fill with null for missing data
                 const md = monthlyData.filter(x => x.country === zone && x.year === parseInt(year));
                 const mdByMonth = {};
