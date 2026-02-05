@@ -121,14 +121,21 @@ def get_summary_total():
 
 
 @app.get("/api/summary/yearly")
-def get_summary_yearly():
+def get_summary_yearly(year: int = None):
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("""
-        SELECT country, total_neg_hours, avg_market_price, capture_price,
-               capture_price_floor0, capture_rate, solar_at_neg_price_pct
-        FROM summary_yearly ORDER BY country
-    """)
+    if year:
+        cursor.execute("""
+            SELECT country, total_neg_hours, avg_market_price, capture_price,
+                   capture_price_floor0, capture_rate, solar_at_neg_price_pct
+            FROM summary_yearly WHERE year = %s ORDER BY country
+        """, (year,))
+    else:
+        cursor.execute("""
+            SELECT country, total_neg_hours, avg_market_price, capture_price,
+                   capture_price_floor0, capture_rate, solar_at_neg_price_pct
+            FROM summary_yearly ORDER BY country
+        """)
     results = cursor.fetchall()
     cursor.close()
     conn.close()
@@ -241,76 +248,148 @@ def get_hourly_day_data(country: str, month: int, day: int, year: int):
     # Build date string for the specific day
     date_str = f"{year}-{month:02d}-{day:02d}"
     
-    # Get price data for the day (Sequence 1 = Day-Ahead Auction)
+    # First, get the AreaCode for this country (handles naming inconsistencies)
     cursor.execute("""
-        SELECT 
-            `DateTime(UTC)`,
-            `Price[Currency/MWh]`,
-            ResolutionCode
-        FROM energy_prices
-        WHERE 
-            AreaDisplayName = %s
-            AND DATE(`DateTime(UTC)`) = %s
-            AND `Sequence` = '1'
-        ORDER BY `DateTime(UTC)`
-    """, (country, date_str))
+        SELECT DISTINCT AreaCode FROM energy_prices
+        WHERE AreaDisplayName = %s AND `Sequence` = '1'
+        LIMIT 1
+    """, (country,))
+    area_code_result = cursor.fetchone()
+    area_code = area_code_result[0] if area_code_result else None
+    
+    # Get price data for the day using AreaCode (handles naming inconsistencies)
+    if area_code:
+        cursor.execute("""
+            SELECT 
+                `DateTime(UTC)`,
+                `Price[Currency/MWh]`,
+                ResolutionCode
+            FROM energy_prices
+            WHERE 
+                AreaCode = %s
+                AND DATE(`DateTime(UTC)`) = %s
+                AND `Sequence` = '1'
+            ORDER BY `DateTime(UTC)`
+        """, (area_code, date_str))
+    else:
+        # Fallback to AreaDisplayName
+        cursor.execute("""
+            SELECT 
+                `DateTime(UTC)`,
+                `Price[Currency/MWh]`,
+                ResolutionCode
+            FROM energy_prices
+            WHERE 
+                AreaDisplayName = %s
+                AND DATE(`DateTime(UTC)`) = %s
+                AND `Sequence` = '1'
+            ORDER BY `DateTime(UTC)`
+        """, (country, date_str))
     
     price_data = cursor.fetchall()
     
-    # Get solar generation data for the day
-    cursor.execute("""
-        SELECT 
-            `DateTime(UTC)`,
-            ActualGenerationOutput
-        FROM generation_per_type
-        WHERE 
-            AreaDisplayName = %s
-            AND DATE(`DateTime(UTC)`) = %s
-            AND ProductionType = 'Solar'
-        ORDER BY `DateTime(UTC)`
-    """, (country, date_str))
+    # Get solar generation data for the day using AreaCode (handles naming inconsistencies)
+    if area_code:
+        cursor.execute("""
+            SELECT 
+                `DateTime(UTC)`,
+                ActualGenerationOutput
+            FROM generation_per_type
+            WHERE 
+                AreaCode = %s
+                AND DATE(`DateTime(UTC)`) = %s
+                AND ProductionType = 'Solar'
+            ORDER BY `DateTime(UTC)`
+        """, (area_code, date_str))
+    else:
+        # Fallback to AreaDisplayName if no AreaCode found
+        cursor.execute("""
+            SELECT 
+                `DateTime(UTC)`,
+                ActualGenerationOutput
+            FROM generation_per_type
+            WHERE 
+                AreaDisplayName = %s
+                AND DATE(`DateTime(UTC)`) = %s
+                AND ProductionType = 'Solar'
+            ORDER BY `DateTime(UTC)`
+        """, (country, date_str))
     
     solar_data = cursor.fetchall()
     
     cursor.close()
     conn.close()
     
-    # Convert price data to list sorted by time
-    # Each entry: (datetime, price)
-    price_list = [(row[0], float(row[1] or 0)) for row in price_data]
-    price_list.sort(key=lambda x: x[0])
+    # Convert price data to dict for lookup (handle both datetime and string keys)
+    prices = {}
+    for row in price_data:
+        ts = row[0]
+        # Normalize to string format
+        if hasattr(ts, 'strftime'):
+            ts_str = ts.strftime('%Y-%m-%d %H:%M:%S')
+        else:
+            ts_str = str(ts)[:19]
+        prices[ts_str] = float(row[1] or 0)
     
     # Convert solar data to dict for lookup
     solar = {}
     for row in solar_data:
-        ts_str = str(row[0])[:19]  # YYYY-MM-DD HH:MM:SS
+        ts = row[0]
+        if hasattr(ts, 'strftime'):
+            ts_str = ts.strftime('%Y-%m-%d %H:%M:%S')
+        else:
+            ts_str = str(ts)[:19]
         solar[ts_str] = float(row[1] or 0)
     
-    # Get all unique timestamps from solar data
-    all_timestamps = sorted(solar.keys())
+    # Generate all 15-minute timestamps for the full day
+    from datetime import timedelta
+    day_start = datetime.strptime(date_str, '%Y-%m-%d')
+    all_timestamps = []
+    for i in range(96):  # 24 hours * 4 (15-min intervals)
+        ts = day_start + timedelta(minutes=i * 15)
+        all_timestamps.append(ts.strftime('%Y-%m-%d %H:%M:%S'))
     
-    # If no solar data, use price timestamps
-    if not all_timestamps:
-        all_timestamps = [str(p[0])[:19] for p in price_list]
-    
-    # Build result with fill-forward prices
+    # Build result with fill-forward for both prices and solar
     result = []
-    price_idx = 0
-    current_price = price_list[0][1] if price_list else 0
+    last_price = None
+    last_solar = 0  # Start with 0 for solar (before sunrise)
+    
+    # Sort the solar keys for fill-forward lookup
+    sorted_solar_keys = sorted(solar.keys())
     
     for ts_str in all_timestamps:
-        # Parse timestamp for comparison
-        ts_dt = datetime.strptime(ts_str, '%Y-%m-%d %H:%M:%S')
+        # Fill-forward price
+        if ts_str in prices:
+            last_price = prices[ts_str]
+        elif last_price is None:
+            # Look for the most recent price before this timestamp
+            for pts in sorted(prices.keys()):
+                if pts <= ts_str:
+                    last_price = prices[pts]
+                else:
+                    break
         
-        # Find the applicable price (last price <= this timestamp)
-        while price_idx < len(price_list) and price_list[price_idx][0] <= ts_dt:
-            current_price = price_list[price_idx][1]
-            price_idx += 1
+        # Fill-forward solar (same logic as price)
+        if ts_str in solar:
+            last_solar = solar[ts_str]
+        else:
+            # Look for the most recent solar value before this timestamp
+            # Only fill forward within daylight hours (don't carry overnight)
+            found_solar = False
+            for sts in sorted_solar_keys:
+                if sts <= ts_str:
+                    last_solar = solar[sts]
+                    found_solar = True
+                elif sts > ts_str:
+                    break
+            # If no solar data found yet (before first reading), keep at 0
+            if not found_solar:
+                last_solar = 0
         
         result.append({
             "timestamp": ts_str,
-            "price": current_price,
-            "solar_mw": solar.get(ts_str, 0)
+            "price": last_price if last_price is not None else 0,
+            "solar_mw": last_solar
         })
     
     return {"data": result, "country": country, "date": date_str}
@@ -619,6 +698,97 @@ def home():
         .chart-container::-webkit-scrollbar-thumb:hover {
             background: var(--pink);
         }
+        
+        /* Day View Section */
+        .day-view-section {
+            margin-top: 2rem;
+            padding: 1.5rem;
+            background: var(--bg-card);
+            border-radius: 12px;
+        }
+        .day-view-title {
+            font-size: 1.5rem;
+            margin-bottom: 1rem;
+            color: var(--text);
+        }
+        .day-view-placeholder {
+            position: relative;
+            height: 300px;
+            border-radius: 8px;
+            overflow: hidden;
+        }
+        .placeholder-chart {
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            opacity: 0.3;
+            filter: blur(1px);
+        }
+        .placeholder-chart canvas {
+            width: 100% !important;
+            height: 100% !important;
+        }
+        .placeholder-overlay {
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: rgba(0, 0, 0, 0.5);
+            border-radius: 8px;
+        }
+        .placeholder-text {
+            text-align: center;
+            padding: 2rem;
+            background: var(--bg-dark);
+            border-radius: 12px;
+            border: 2px dashed var(--cyan);
+        }
+        .placeholder-text p {
+            margin: 0.5rem 0;
+            color: var(--text);
+        }
+        .placeholder-text strong {
+            color: var(--cyan);
+        }
+        .day-view-content {
+            height: 350px;
+        }
+        .day-view-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 1rem;
+        }
+        .day-view-header h3 {
+            margin: 0;
+            color: var(--cyan);
+        }
+        .close-day-view {
+            background: transparent;
+            border: 1px solid var(--text-muted);
+            color: var(--text);
+            width: 32px;
+            height: 32px;
+            border-radius: 50%;
+            cursor: pointer;
+            font-size: 1.2rem;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .close-day-view:hover {
+            background: var(--pink);
+            border-color: var(--pink);
+        }
+        .day-chart-container {
+            height: 300px;
+        }
     </style>
 </head>
 <body>
@@ -725,14 +895,28 @@ def home():
                 </div>
             </div>
             
-    <!-- Modal for hourly day view -->
-    <div id="dayModal" class="modal">
-        <div class="modal-content">
-            <div class="modal-header">
-                <h2 class="modal-title" id="modalTitle">Day View</h2>
-                <button class="close-modal" onclick="closeDayModal()">&times;</button>
+    <!-- Day View Section (always visible) -->
+    <div class="day-view-section">
+        <h2 class="day-view-title">Day View</h2>
+        <div id="dayViewPlaceholder" class="day-view-placeholder">
+            <div class="placeholder-chart">
+                <canvas id="placeholderChart"></canvas>
             </div>
-            <div class="modal-chart-container">
+            <div class="placeholder-overlay">
+                <div class="placeholder-text">
+                    <p><strong>How to view hourly data:</strong></p>
+                    <p>1. Select a specific bidding zone from the dropdown</p>
+                    <p>2. Select a specific month</p>
+                    <p>3. Click on any day bar in the charts above</p>
+                </div>
+            </div>
+        </div>
+        <div id="dayViewContent" class="day-view-content" style="display: none;">
+            <div class="day-view-header">
+                <h3 id="dayViewTitle">—</h3>
+                <button class="close-day-view" onclick="closeDayView()">×</button>
+            </div>
+            <div class="day-chart-container">
                 <canvas id="dayChart"></canvas>
             </div>
         </div>
@@ -780,7 +964,7 @@ def home():
             const year = document.getElementById('yearSelect').value;
             const [t, y, m] = await Promise.all([
                 fetch('/api/summary/total').then(r => r.json()),
-                fetch('/api/summary/yearly').then(r => r.json()),
+                fetch(`/api/summary/yearly?year=${year}`).then(r => r.json()),
                 fetch(`/api/summary/monthly?year=${year}`).then(r => r.json())
             ]);
             totalData = t; yearlyData = y.data; monthlyData = m.data;
@@ -793,16 +977,24 @@ def home():
             const year = document.getElementById('yearSelect').value;
             let d, labels, datasets;
             
-            // Reload monthly and yearly data
+            // Reload monthly and yearly data for the selected year
             const [mRes, yRes] = await Promise.all([
                 fetch(`/api/summary/monthly?year=${year}`),
-                fetch('/api/summary/yearly')
+                fetch(`/api/summary/yearly?year=${year}`)
             ]);
             monthlyData = (await mRes.json()).data;
             yearlyData = (await yRes.json()).data;
             
             if (zone === 'all' && month === 'all') {
-                d = totalData;
+                // Aggregate stats from yearlyData (which is filtered by selected year)
+                d = {
+                    neg_hours: yearlyData.reduce((s, x) => s + (x.neg_hours || 0), 0),
+                    avg_market_price: yearlyData.length ? yearlyData.reduce((s, x) => s + (x.avg_market_price || 0), 0) / yearlyData.length : 0,
+                    capture_price: yearlyData.length ? yearlyData.reduce((s, x) => s + (x.capture_price || 0), 0) / yearlyData.length : 0,
+                    capture_price_floor0: yearlyData.length ? yearlyData.reduce((s, x) => s + (x.capture_price_floor0 || 0), 0) / yearlyData.length : 0,
+                    capture_rate: yearlyData.length ? yearlyData.reduce((s, x) => s + (x.capture_rate || 0), 0) / yearlyData.length : 0,
+                    solar_at_neg_price_pct: yearlyData.length ? yearlyData.reduce((s, x) => s + (x.solar_at_neg_price_pct || 0), 0) / yearlyData.length : 0
+                };
                 // Sort each dataset by its own metric (descending)
                 const allData = [...yearlyData];
                 const sortedByNegHours = [...allData].sort((a,b) => b.neg_hours - a.neg_hours);
@@ -822,9 +1014,8 @@ def home():
                     sortedBySolarNeg.map(x => x.solar_at_neg_price_pct)
                 ];
             } else if (zone !== 'all' && month === 'all') {
-                // For 2025, use yearly data (properly calculated generation-weighted stats)
-                // For other years, calculate from monthly data as fallback
-                const yd = (parseInt(year) === 2025) ? yearlyData.find(x => x.country === zone) : null;
+                // Use yearlyData (which is already filtered by selected year)
+                const yd = yearlyData.find(x => x.country === zone);
                 if (yd) {
                     d = { 
                         neg_hours: yd.neg_hours, 
@@ -835,19 +1026,19 @@ def home():
                         solar_at_neg_price_pct: yd.solar_at_neg_price_pct 
                     };
                 } else {
-                    // Fallback: calculate from monthly data (for years without yearly summary)
-                    const md_stats = monthlyData.filter(x => x.country === zone && x.year === parseInt(year));
+                    // Fallback: calculate from monthly data if zone not in yearly summary
+                    const md_stats = monthlyData.filter(x => x.country === zone);
                     d = {
-                        neg_hours: md_stats.reduce((s,x) => s + x.neg_hours, 0),
-                        avg_market_price: md_stats.length ? md_stats.reduce((s,x) => s + x.avg_market_price, 0) / md_stats.length : 0,
-                        capture_price: md_stats.length ? md_stats.reduce((s,x) => s + x.capture_price, 0) / md_stats.length : 0,
-                        capture_price_floor0: md_stats.length ? md_stats.reduce((s,x) => s + x.capture_price_floor0, 0) / md_stats.length : 0,
-                        capture_rate: md_stats.length ? md_stats.reduce((s,x) => s + x.capture_rate, 0) / md_stats.length : 0,
-                        solar_at_neg_price_pct: md_stats.length ? md_stats.reduce((s,x) => s + x.solar_at_neg_price_pct, 0) / md_stats.length : 0
+                        neg_hours: md_stats.reduce((s,x) => s + (x.neg_hours || 0), 0),
+                        avg_market_price: md_stats.length ? md_stats.reduce((s,x) => s + (x.avg_market_price || 0), 0) / md_stats.length : 0,
+                        capture_price: md_stats.length ? md_stats.reduce((s,x) => s + (x.capture_price || 0), 0) / md_stats.length : 0,
+                        capture_price_floor0: md_stats.length ? md_stats.reduce((s,x) => s + (x.capture_price_floor0 || 0), 0) / md_stats.length : 0,
+                        capture_rate: md_stats.length ? md_stats.reduce((s,x) => s + (x.capture_rate || 0), 0) / md_stats.length : 0,
+                        solar_at_neg_price_pct: md_stats.length ? md_stats.reduce((s,x) => s + (x.solar_at_neg_price_pct || 0), 0) / md_stats.length : 0
                     };
                 }
                 // Always show 12 months, fill with null for missing data
-                const md = monthlyData.filter(x => x.country === zone && x.year === parseInt(year));
+                const md = monthlyData.filter(x => x.country === zone);
                 const mdByMonth = {};
                 md.forEach(x => { mdByMonth[x.month] = x; });
                 
@@ -900,12 +1091,22 @@ def home():
                     solar_at_neg_price_pct: dailyData.length ? dailyData.reduce((s,x) => s + x.solar_at_neg_price_pct, 0) / dailyData.length : 0
                 };
                 
-                const sorted = dailyData.sort((a,b) => a.day - b.day);
-                labels = sorted.map(x => x.day.toString());
+                // Get number of days in the selected month
+                const daysInMonth = new Date(parseInt(year), parseInt(month), 0).getDate();
+                
+                // Create lookup by day
+                const dailyByDay = {};
+                dailyData.forEach(x => { dailyByDay[x.day] = x; });
+                
+                // Always show all days of month, fill with null for missing
+                labels = Array.from({length: daysInMonth}, (_, i) => (i + 1).toString());
                 datasets = [
-                    sorted.map(x => x.neg_hours), sorted.map(x => x.avg_market_price),
-                    sorted.map(x => x.capture_price), sorted.map(x => x.capture_price_floor0),
-                    sorted.map(x => x.capture_rate), sorted.map(x => x.solar_at_neg_price_pct)
+                    labels.map((_, i) => dailyByDay[i+1] ? dailyByDay[i+1].neg_hours : null),
+                    labels.map((_, i) => dailyByDay[i+1] ? dailyByDay[i+1].avg_market_price : null),
+                    labels.map((_, i) => dailyByDay[i+1] ? dailyByDay[i+1].capture_price : null),
+                    labels.map((_, i) => dailyByDay[i+1] ? dailyByDay[i+1].capture_price_floor0 : null),
+                    labels.map((_, i) => dailyByDay[i+1] ? dailyByDay[i+1].capture_rate : null),
+                    labels.map((_, i) => dailyByDay[i+1] ? dailyByDay[i+1].solar_at_neg_price_pct : null)
                 ];
             }
             
@@ -1001,8 +1202,8 @@ def home():
                 
                 charts[i] = new Chart(canvas, chartConfig);
                 
-                // Add click handler to chart6 (Solar Volume @ Neg Price) when viewing daily data
-                if (i === 5 && currentZone !== 'all' && currentMonth !== 'all') {
+                // Add click handler to ALL charts when viewing daily data (specific zone + month)
+                if (currentZone !== 'all' && currentMonth !== 'all') {
                     canvas.style.cursor = 'pointer';
                     // Store values for the click handler
                     const clickZone = currentZone;
@@ -1011,31 +1212,93 @@ def home():
                     const clickLabels = [...labels];
                     const chartRef = charts[i];
                     
-                    // Add click event listener to the canvas
+                    // Add click event listener - allow clicking anywhere on the chart area
                     canvas.addEventListener('click', function(evt) {
-                        const points = chartRef.getElementsAtEventForMode(evt, 'nearest', { intersect: true }, true);
+                        // First try to get the nearest bar element
+                        const points = chartRef.getElementsAtEventForMode(evt, 'nearest', { intersect: false }, true);
                         if (points.length) {
                             const firstPoint = points[0];
                             const dayIndex = firstPoint.index;
                             const day = parseInt(clickLabels[dayIndex]);
                             if (!isNaN(day) && day > 0 && day <= 31) {
-                                openDayModal(clickZone, clickMonth, day, clickYear);
+                                openDayView(clickZone, clickMonth, day, clickYear);
+                            }
+                        } else {
+                            // Fallback: calculate index from X position
+                            const rect = canvas.getBoundingClientRect();
+                            const x = evt.clientX - rect.left;
+                            const chartArea = chartRef.chartArea;
+                            if (x >= chartArea.left && x <= chartArea.right) {
+                                const relativeX = (x - chartArea.left) / (chartArea.right - chartArea.left);
+                                const dayIndex = Math.floor(relativeX * clickLabels.length);
+                                if (dayIndex >= 0 && dayIndex < clickLabels.length) {
+                                    const day = parseInt(clickLabels[dayIndex]);
+                                    if (!isNaN(day) && day > 0 && day <= 31) {
+                                        openDayView(clickZone, clickMonth, day, clickYear);
+                                    }
+                                }
                             }
                         }
                     });
-                } else if (i === 5) {
+                } else {
                     canvas.style.cursor = 'default';
                 }
             }
         }
         
         let dayChart = null;
+        let placeholderChart = null;
         
-        function openDayModal(country, month, day, year) {
-            const modal = document.getElementById('dayModal');
-            const modalTitle = document.getElementById('modalTitle');
-            modalTitle.textContent = `${country} - ${MONTHS[month-1]} ${day}, ${year}`;
-            modal.style.display = 'block';
+        // Initialize placeholder chart with example data
+        function initPlaceholderChart() {
+            const canvas = document.getElementById('placeholderChart');
+            if (placeholderChart) placeholderChart.destroy();
+            
+            // Generate example data for a typical day
+            const labels = [];
+            const prices = [];
+            const solar = [];
+            for (let h = 0; h < 24; h++) {
+                labels.push(`${h.toString().padStart(2,'0')}:00`);
+                // Simulated price pattern (higher in evening, lower at noon)
+                prices.push(50 + 30 * Math.sin((h - 6) * Math.PI / 12) + Math.random() * 10);
+                // Simulated solar pattern (peak at noon)
+                solar.push(Math.max(0, 8000 * Math.sin((h - 6) * Math.PI / 12)));
+            }
+            
+            placeholderChart = new Chart(canvas, {
+                type: 'line',
+                data: {
+                    labels,
+                    datasets: [
+                        { label: 'Price (€/MWh)', data: prices, borderColor: '#4cc9f0', backgroundColor: 'rgba(76, 201, 240, 0.2)', fill: true, yAxisID: 'y', tension: 0.3 },
+                        { label: 'Solar (MW)', data: solar, borderColor: '#fee440', backgroundColor: 'rgba(254, 228, 64, 0.2)', fill: true, yAxisID: 'y1', tension: 0.3 }
+                    ]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: { legend: { display: false } },
+                    scales: {
+                        y: { position: 'left', grid: { color: 'rgba(255,255,255,0.1)' } },
+                        y1: { position: 'right', grid: { display: false } },
+                        x: { grid: { color: 'rgba(255,255,255,0.05)' } }
+                    }
+                }
+            });
+        }
+        
+        function openDayView(country, month, day, year) {
+            const placeholder = document.getElementById('dayViewPlaceholder');
+            const content = document.getElementById('dayViewContent');
+            const title = document.getElementById('dayViewTitle');
+            
+            title.textContent = `${getZoneName(country)} (${country}) — ${MONTHS[month-1]} ${day}, ${year}`;
+            placeholder.style.display = 'none';
+            content.style.display = 'block';
+            
+            // Scroll to the day view section
+            document.querySelector('.day-view-section').scrollIntoView({ behavior: 'smooth', block: 'start' });
             
             // Load hourly data
             fetch(`/api/hourly/day?country=${encodeURIComponent(country)}&month=${month}&day=${day}&year=${year}`)
@@ -1049,9 +1312,11 @@ def home():
                 });
         }
         
-        function closeDayModal() {
-            const modal = document.getElementById('dayModal');
-            modal.style.display = 'none';
+        function closeDayView() {
+            const placeholder = document.getElementById('dayViewPlaceholder');
+            const content = document.getElementById('dayViewContent');
+            placeholder.style.display = 'block';
+            content.style.display = 'none';
             if (dayChart) {
                 dayChart.destroy();
                 dayChart = null;
@@ -1112,7 +1377,8 @@ def home():
                             backgroundColor: 'rgba(254, 228, 64, 0.4)',
                             fill: true,
                             yAxisID: 'y1',
-                            tension: 0.3,
+                            stepped: 'before',
+                            tension: 0,
                             pointRadius: 0,
                             pointHoverRadius: 4,
                             borderWidth: 2
@@ -1230,6 +1496,7 @@ def home():
         document.getElementById('monthSelect').addEventListener('change', updateDisplay);
         document.getElementById('yearSelect').addEventListener('change', updateDisplay);
         loadData();
+        initPlaceholderChart();
     </script>
 </body>
 </html>
