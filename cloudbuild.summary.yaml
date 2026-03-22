@@ -1,0 +1,5 @@
+steps:
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['build', '--no-cache', '-f', 'Dockerfile.daily-summary', '-t', 'gcr.io/$PROJECT_ID/daily-summary-update:v2', '.']
+images:
+  - 'gcr.io/$PROJECT_ID/daily-summary-update:v2'

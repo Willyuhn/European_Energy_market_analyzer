@@ -23,7 +23,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application code
 COPY app.py .
 
-# Copy scripts folder (for daily update functionality)
+# Copy scripts and static assets
 COPY scripts/ ./scripts/
 
 # Copy static folder (for profile picture and other assets)
