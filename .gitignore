@@ -1,0 +1,47 @@
+# Secrets & local env (never commit)
+.env
+.env.*
+!.env.example
+env.yaml
+secrets/*
+!secrets/README.md
+!secrets/env.example.yaml
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+venv/
+.venv/
+ENV/
+env/
+
+# Node
+node_modules/
+npm-debug.log*
+
+# IDE / OS
+.idea/
+.vscode/*
+!.vscode/workspace.code-workspace
+*.swp
+*.swo
+.DS_Store
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Large local data (ENTSO-E CSVs)
+*.csv
+Energy Prices/
+Generation_per_type_new/
+
+# Optional: uncomment to keep a local-only archive folder out of git
+# alt/
