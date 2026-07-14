@@ -1,0 +1,40 @@
+name: Daily ENTSO-E update
+
+# Läuft täglich und stößt per SSH das Update-Skript auf Hostinger an.
+# Der SSH-Key ist serverseitig auf ein Forced Command beschränkt
+# (~/.ssh/authorized_keys: command="…/enerlyzer-etl/daily.sh"), d. h. dieser
+# Key kann ausschließlich das Update starten – keine Shell, kein Dateizugriff.
+# Secrets bleiben auch im öffentlichen Repo geheim; der Workflow läuft nur auf
+# dem Default-Branch (schedule / manuell), nie aus fremden Fork-PRs.
+
+on:
+  schedule:
+    - cron: "0 6 * * *" # täglich 06:00 UTC
+  workflow_dispatch: {}
+
+concurrency:
+  group: daily-entsoe
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Trigger ENTSO-E import + summary rebuild on Hostinger (SSH)
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -p "$SSH_PORT" "$SSH_HOST" >> ~/.ssh/known_hosts 2>/dev/null || true
+          # Forced command auf dem Server führt daily.sh aus; das hier übergebene
+          # "true" wird ignoriert. Ausgabe von daily.sh erscheint im Action-Log.
+          ssh -i ~/.ssh/id_ed25519 -p "$SSH_PORT" \
+              -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new \
+              "$SSH_USER@$SSH_HOST" true
