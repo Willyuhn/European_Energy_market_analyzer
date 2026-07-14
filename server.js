@@ -10,6 +10,8 @@ const path = require("path");
     const user = process.env.USER || process.env.LOGNAME;
     const candidates = [
       path.join(__dirname, ".env"),
+      // Hostinger lsnode sets HOME to the site dir, not /home/<user>
+      path.join(__dirname, "../../../enerlyzer-etl/.env"),
       path.join(home, "enerlyzer-etl", ".env"),
     ];
     if (user) candidates.push(path.join("/home", user, "enerlyzer-etl", ".env"));
