@@ -43,5 +43,5 @@ npm-debug.log*
 Energy Prices/
 Generation_per_type_new/
 
-# Optional: uncomment to keep a local-only archive folder out of git
-# alt/
+# Local-only legacy archive (contains old hardcoded credentials)
+alt/
