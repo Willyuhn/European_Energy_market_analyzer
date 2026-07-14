@@ -6,10 +6,13 @@ const path = require("path");
 (() => {
   try {
     const fs = require("fs"), os = require("os");
+    const home = process.env.HOME || process.env.USERPROFILE || os.homedir();
+    const user = process.env.USER || process.env.LOGNAME;
     const candidates = [
       path.join(__dirname, ".env"),
-      path.join(os.homedir(), "enerlyzer-etl", ".env"),
+      path.join(home, "enerlyzer-etl", ".env"),
     ];
+    if (user) candidates.push(path.join("/home", user, "enerlyzer-etl", ".env"));
     for (const p of candidates) {
       if (!fs.existsSync(p)) continue;
       for (const line of fs.readFileSync(p, "utf8").split("\n")) {
