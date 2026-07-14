@@ -1,4 +1,31 @@
 const path = require("path");
+// Load local .env and OVERRIDE host-injected env (e.g. Hostinger's Node app config).
+// Checks the app dir first, then ~/enerlyzer-etl/.env (outside the deploy dir, so it
+// survives redeploys). Deliberately overrides process.env so stale injected values
+// (old DB host/user) can't win over the intended local config.
+(() => {
+  try {
+    const fs = require("fs"), os = require("os");
+    const candidates = [
+      path.join(__dirname, ".env"),
+      path.join(os.homedir(), "enerlyzer-etl", ".env"),
+    ];
+    for (const p of candidates) {
+      if (!fs.existsSync(p)) continue;
+      for (const line of fs.readFileSync(p, "utf8").split("\n")) {
+        const m = line.match(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$/);
+        if (!m) continue;
+        let v = m[2];
+        if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) {
+          v = v.slice(1, -1);
+        }
+        process.env[m[1]] = v;
+      }
+    }
+  } catch (e) {
+    console.error("[enerlyzer] env loader failed:", e.message);
+  }
+})();
 const express = require("express");
 const mysql = require("mysql2/promise");
 
