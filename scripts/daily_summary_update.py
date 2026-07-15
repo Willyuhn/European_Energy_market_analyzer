@@ -151,44 +151,109 @@ def main():
                    "DELETE old monthly rows")
 
         phase3_monthly_sql = f"""
-        INSERT INTO summary_monthly (year, country, month, neg_hours, avg_market_price, 
-                                     capture_price, capture_price_floor0, capture_rate, solar_at_neg_price_pct)
+        INSERT INTO summary_monthly (year, country, month, neg_hours, avg_market_price)
         SELECT 
-            {TARGET_YEAR}, country, month,
-            SUM(neg_hours),
-            ROUND(AVG(avg_market_price), 2),
-            ROUND(AVG(capture_price), 2),
-            ROUND(AVG(capture_price_floor0), 2),
-            ROUND(AVG(capture_rate), 2),
-            ROUND(AVG(solar_at_neg_price_pct), 2)
-        FROM summary_daily
-        WHERE year = {TARGET_YEAR}
-        GROUP BY country, month
+            {TARGET_YEAR}, AreaDisplayName, MONTH(`DateTime(UTC)`),
+            SUM(CASE WHEN `Price[Currency/MWh]` < 0 THEN 0.25 ELSE 0 END),
+            ROUND(AVG(`Price[Currency/MWh]`), 2)
+        FROM energy_prices
+        WHERE YEAR(`DateTime(UTC)`) = {TARGET_YEAR}
+          AND ContractType = 'Day-ahead'
+          AND (`Sequence` IS NULL OR `Sequence` NOT IN ('2', '3'))
+        GROUP BY AreaDisplayName, MONTH(`DateTime(UTC)`)
         """
         
-        monthly_rows = execute_sql(cursor, phase3_monthly_sql, "INSERT monthly rows")
+        monthly_rows = execute_sql(cursor, phase3_monthly_sql, "INSERT monthly base rows")
+
+        phase3_monthly_cap_sql = f"""
+        UPDATE summary_monthly sm
+        JOIN (
+            SELECT 
+                ep.AreaDisplayName AS country,
+                MONTH(ep.`DateTime(UTC)`) AS month,
+                ROUND(SUM(gp.ActualGenerationOutput * 0.25 * ep.`Price[Currency/MWh]`) / 
+                      NULLIF(SUM(gp.ActualGenerationOutput * 0.25), 0), 2) AS capture_price,
+                ROUND(SUM(gp.ActualGenerationOutput * 0.25 * 
+                      CASE WHEN ep.`Price[Currency/MWh]` < 0 THEN 0 ELSE ep.`Price[Currency/MWh]` END) / 
+                      NULLIF(SUM(gp.ActualGenerationOutput * 0.25), 0), 2) AS capture_price_floor0,
+                ROUND(100.0 * SUM(CASE WHEN ep.`Price[Currency/MWh]` < 0 THEN gp.ActualGenerationOutput * 0.25 ELSE 0 END) / 
+                      NULLIF(SUM(gp.ActualGenerationOutput * 0.25), 0), 2) AS solar_pct
+            FROM energy_prices ep
+            JOIN generation_per_type gp 
+                ON ep.AreaCode = gp.AreaCode AND ep.`DateTime(UTC)` = gp.`DateTime(UTC)`
+            WHERE YEAR(ep.`DateTime(UTC)`) = {TARGET_YEAR}
+              AND ep.ContractType = 'Day-ahead'
+              AND gp.ProductionType = 'Solar' 
+              AND gp.ActualGenerationOutput > 0
+            GROUP BY ep.AreaDisplayName, MONTH(ep.`DateTime(UTC)`)
+        ) cap ON sm.country = cap.country AND sm.month = cap.month
+        SET sm.capture_price = cap.capture_price,
+            sm.capture_price_floor0 = cap.capture_price_floor0,
+            sm.solar_at_neg_price_pct = cap.solar_pct
+        WHERE sm.year = {TARGET_YEAR}
+        """
+        execute_sql(cursor, phase3_monthly_cap_sql, "UPDATE monthly capture metrics")
+
+        phase3_monthly_rate_sql = f"""
+        UPDATE summary_monthly
+        SET capture_rate = ROUND(100.0 * capture_price / NULLIF(avg_market_price, 0), 2)
+        WHERE year = {TARGET_YEAR} AND avg_market_price > 0
+        """
+        execute_sql(cursor, phase3_monthly_rate_sql, "UPDATE monthly capture_rate")
 
         # Yearly
         execute_sql(cursor, f"DELETE FROM summary_yearly WHERE year = {TARGET_YEAR}",
                    "DELETE old yearly rows")
 
         phase3_yearly_sql = f"""
-        INSERT INTO summary_yearly (year, country, total_neg_hours, avg_market_price, 
-                                    capture_price, capture_price_floor0, capture_rate, solar_at_neg_price_pct)
+        INSERT INTO summary_yearly (year, country, total_neg_hours, avg_market_price)
         SELECT 
-            {TARGET_YEAR}, country,
-            SUM(neg_hours),
-            ROUND(AVG(avg_market_price), 2),
-            ROUND(AVG(capture_price), 2),
-            ROUND(AVG(capture_price_floor0), 2),
-            ROUND(AVG(capture_rate), 2),
-            ROUND(AVG(solar_at_neg_price_pct), 2)
-        FROM summary_monthly
-        WHERE year = {TARGET_YEAR}
-        GROUP BY country
+            {TARGET_YEAR}, AreaDisplayName,
+            SUM(CASE WHEN `Price[Currency/MWh]` < 0 THEN 0.25 ELSE 0 END),
+            ROUND(AVG(`Price[Currency/MWh]`), 2)
+        FROM energy_prices
+        WHERE YEAR(`DateTime(UTC)`) = {TARGET_YEAR}
+          AND ContractType = 'Day-ahead'
+          AND (`Sequence` IS NULL OR `Sequence` NOT IN ('2', '3'))
+        GROUP BY AreaDisplayName
         """
         
-        yearly_rows = execute_sql(cursor, phase3_yearly_sql, "INSERT yearly rows")
+        yearly_rows = execute_sql(cursor, phase3_yearly_sql, "INSERT yearly base rows")
+
+        phase3_yearly_cap_sql = f"""
+        UPDATE summary_yearly sy
+        JOIN (
+            SELECT 
+                ep.AreaDisplayName AS country,
+                ROUND(SUM(gp.ActualGenerationOutput * 0.25 * ep.`Price[Currency/MWh]`) / 
+                      NULLIF(SUM(gp.ActualGenerationOutput * 0.25), 0), 2) AS capture_price,
+                ROUND(SUM(gp.ActualGenerationOutput * 0.25 * 
+                      CASE WHEN ep.`Price[Currency/MWh]` < 0 THEN 0 ELSE ep.`Price[Currency/MWh]` END) / 
+                      NULLIF(SUM(gp.ActualGenerationOutput * 0.25), 0), 2) AS capture_price_floor0,
+                ROUND(100.0 * SUM(CASE WHEN ep.`Price[Currency/MWh]` < 0 THEN gp.ActualGenerationOutput * 0.25 ELSE 0 END) / 
+                      NULLIF(SUM(gp.ActualGenerationOutput * 0.25), 0), 2) AS solar_pct
+            FROM energy_prices ep
+            JOIN generation_per_type gp 
+                ON ep.AreaCode = gp.AreaCode AND ep.`DateTime(UTC)` = gp.`DateTime(UTC)`
+            WHERE YEAR(ep.`DateTime(UTC)`) = {TARGET_YEAR}
+              AND ep.ContractType = 'Day-ahead'
+              AND gp.ProductionType = 'Solar' 
+              AND gp.ActualGenerationOutput > 0
+            GROUP BY ep.AreaDisplayName
+        ) cap ON sy.country = cap.country
+        SET sy.capture_price = cap.capture_price,
+            sy.capture_price_floor0 = cap.capture_price_floor0,
+            sy.solar_at_neg_price_pct = cap.solar_pct
+        WHERE sy.year = {TARGET_YEAR}
+        """
+        execute_sql(cursor, phase3_yearly_cap_sql, "UPDATE yearly capture metrics")
+
+        phase3_yearly_rate_sql = f"""
+        UPDATE summary_yearly
+        SET capture_rate = ROUND(100.0 * capture_price / NULLIF(avg_market_price, 0), 2)
+        WHERE year = {TARGET_YEAR} AND avg_market_price > 0
+        """
+        execute_sql(cursor, phase3_yearly_rate_sql, "UPDATE yearly capture_rate")
         log(f"  Phase 3 complete: {monthly_rows} monthly, {yearly_rows} yearly rows")
 
         # =====================================================================
