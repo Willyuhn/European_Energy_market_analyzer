@@ -1,20 +1,30 @@
 const path = require("path");
+const fs = require("fs");
+const os = require("os");
+const { spawn } = require("child_process");
+const cron = require("node-cron");
+
 // Load local .env and OVERRIDE host-injected env (e.g. Hostinger's Node app config).
 // Checks the app dir first, then ~/enerlyzer-etl/.env (outside the deploy dir, so it
 // survives redeploys). Deliberately overrides process.env so stale injected values
 // (old DB host/user) can't win over the intended local config.
+function etlDirCandidates() {
+  const home = process.env.HOME || process.env.USERPROFILE || os.homedir();
+  const user = process.env.USER || process.env.LOGNAME;
+  const dirs = [
+    path.join(__dirname, "../../../enerlyzer-etl"),
+    path.join(home, "enerlyzer-etl"),
+  ];
+  if (user) dirs.push(path.join("/home", user, "enerlyzer-etl"));
+  return dirs;
+}
+
 (() => {
   try {
-    const fs = require("fs"), os = require("os");
-    const home = process.env.HOME || process.env.USERPROFILE || os.homedir();
-    const user = process.env.USER || process.env.LOGNAME;
     const candidates = [
       path.join(__dirname, ".env"),
-      // Hostinger lsnode sets HOME to the site dir, not /home/<user>
-      path.join(__dirname, "../../../enerlyzer-etl/.env"),
-      path.join(home, "enerlyzer-etl", ".env"),
+      ...etlDirCandidates().map((d) => path.join(d, ".env")),
     ];
-    if (user) candidates.push(path.join("/home", user, "enerlyzer-etl", ".env"));
     for (const p of candidates) {
       if (!fs.existsSync(p)) continue;
       for (const line of fs.readFileSync(p, "utf8").split("\n")) {
@@ -354,7 +364,128 @@ function toSqlTs(date) {
   );
 }
 
+/* ---------- daily ENTSO-E update (Hostinger has no hPanel cron for Node apps) ---------- */
+const DAILY_CRON_EXPR = process.env.DAILY_CRON_EXPR || "0 6 * * *"; // 06:00 Europe/Berlin
+const DAILY_CRON_TZ = process.env.DAILY_CRON_TZ || "Europe/Berlin";
+let dailyCronStatus = {
+  enabled: false,
+  expr: DAILY_CRON_EXPR,
+  tz: DAILY_CRON_TZ,
+  script: null,
+  lastTriggerAt: null,
+  lastError: null,
+  running: false,
+};
+
+function resolveDailyScript() {
+  const override = process.env.DAILY_SCRIPT_PATH;
+  if (override && fs.existsSync(override)) return override;
+  for (const dir of etlDirCandidates()) {
+    const p = path.join(dir, "daily.sh");
+    if (fs.existsSync(p)) return p;
+  }
+  return null;
+}
+
+function triggerDailyUpdate(reason) {
+  if (dailyCronStatus.running) {
+    console.warn(`[enerlyzer] daily update skipped (${reason}): already running`);
+    return false;
+  }
+  const script = resolveDailyScript();
+  dailyCronStatus.script = script;
+  if (!script) {
+    dailyCronStatus.lastError = "daily.sh not found";
+    console.error("[enerlyzer] daily update: daily.sh not found in", etlDirCandidates());
+    return false;
+  }
+  const lockPath = path.join(path.dirname(script), "logs", "daily.lock");
+  try {
+    fs.mkdirSync(path.dirname(lockPath), { recursive: true });
+    if (fs.existsSync(lockPath)) {
+      const ageMs = Date.now() - fs.statSync(lockPath).mtimeMs;
+      // Stale lock after 2h (previous crash)
+      if (ageMs < 2 * 60 * 60 * 1000) {
+        console.warn(`[enerlyzer] daily update skipped (${reason}): lock present`);
+        return false;
+      }
+      fs.unlinkSync(lockPath);
+    }
+    fs.writeFileSync(lockPath, `${process.pid} ${new Date().toISOString()} ${reason}\n`);
+  } catch (e) {
+    dailyCronStatus.lastError = String(e.message || e);
+    console.error("[enerlyzer] daily lock failed:", e.message);
+    return false;
+  }
+
+  dailyCronStatus.running = true;
+  dailyCronStatus.lastTriggerAt = new Date().toISOString();
+  dailyCronStatus.lastError = null;
+  console.log(`[enerlyzer] daily update starting (${reason}): ${script}`);
+
+  const child = spawn("/bin/bash", [script], {
+    cwd: path.dirname(script),
+    detached: true,
+    stdio: "ignore",
+    env: process.env,
+  });
+  child.unref();
+  child.on("error", (err) => {
+    dailyCronStatus.running = false;
+    dailyCronStatus.lastError = String(err.message || err);
+    try { fs.unlinkSync(lockPath); } catch (_) {}
+    console.error("[enerlyzer] daily update spawn failed:", err.message);
+  });
+  // Parent only starts the job; daily.sh manages its own log. Clear "running"
+  // after a short grace so a second trigger the same minute is blocked, then
+  // rely on the lock file for longer overlap protection.
+  setTimeout(() => {
+    dailyCronStatus.running = false;
+  }, 60_000);
+  // Best-effort: remove lock when the detached process exits (may not fire if
+  // process group fully detaches — daily.sh also overwrites logs each day).
+  child.on("exit", (code) => {
+    dailyCronStatus.running = false;
+    try { fs.unlinkSync(lockPath); } catch (_) {}
+    console.log(`[enerlyzer] daily update child exited code=${code}`);
+  });
+  return true;
+}
+
+function startDailyCron() {
+  if (String(process.env.DAILY_CRON_DISABLE || "").match(/^(1|true|yes)$/i)) {
+    console.log("[enerlyzer] daily cron disabled via DAILY_CRON_DISABLE");
+    return;
+  }
+  if (!cron.validate(DAILY_CRON_EXPR)) {
+    console.error(`[enerlyzer] invalid DAILY_CRON_EXPR: ${DAILY_CRON_EXPR}`);
+    return;
+  }
+  const script = resolveDailyScript();
+  dailyCronStatus.script = script;
+  dailyCronStatus.enabled = true;
+  cron.schedule(
+    DAILY_CRON_EXPR,
+    () => {
+      triggerDailyUpdate("cron");
+    },
+    { timezone: DAILY_CRON_TZ }
+  );
+  console.log(
+    `[enerlyzer] daily cron scheduled: "${DAILY_CRON_EXPR}" tz=${DAILY_CRON_TZ}` +
+      (script ? ` script=${script}` : " (WARNING: daily.sh not found yet)")
+  );
+}
+
+app.get("/api/cron/status", (_req, res) => {
+  res.json({
+    ...dailyCronStatus,
+    scriptExists: Boolean(dailyCronStatus.script && fs.existsSync(dailyCronStatus.script)),
+  });
+});
+
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`enerlyzer (Express) listening on :${PORT}`);
+  startDailyCron();
 });
 

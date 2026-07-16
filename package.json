@@ -9,11 +9,14 @@
     "node": ">=18"
   },
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "db:bootstrap": "python3 scripts/etl/entsoe_import.py --bootstrap-schema",
+    "import:entsoe": "python3 scripts/etl/entsoe_import.py"
   },
   "dependencies": {
+    "dotenv": "^16.4.5",
     "express": "^4.19.2",
-    "mysql2": "^3.11.4"
+    "mysql2": "^3.11.4",
+    "node-cron": "^3.0.3"
   }
 }
-

@@ -582,15 +582,11 @@
             // daily mode (zone + month) — bars represent days, clickable for the day view
             const daily = await fetchJson(`/api/summary/daily?country=${encodeURIComponent(zone)}&month=${encodeURIComponent(month)}&year=${encodeURIComponent(year)}`);
             const dd = daily.data || [];
-            const n = dd.length || 1;
-            stats = {
-              neg_hours: dd.reduce((s,x)=> s+(x.neg_hours||0),0),
-              avg_market_price: dd.reduce((s,x)=> s+(x.avg_market_price||0),0)/n,
-              capture_price: dd.reduce((s,x)=> s+(x.capture_price||0),0)/n,
-              capture_price_floor0: dd.reduce((s,x)=> s+(x.capture_price_floor0||0),0)/n,
-              capture_rate: dd.reduce((s,x)=> s+(x.capture_rate||0),0)/n,
-              solar_at_neg_price_pct: dd.reduce((s,x)=> s+(x.solar_at_neg_price_pct||0),0)/n
-            };
+            // Top overview must show the volume-weighted monthly value from summary_monthly
+            // (same source as the month bar in the full-year view), NOT the equal-weight
+            // average of daily capture prices.
+            const mrow = monthlyData.find(x=> x.country===zone && Number(x.month)===Number(month));
+            stats = mrow || {neg_hours:0,avg_market_price:0,capture_price:0,capture_price_floor0:0,capture_rate:0,solar_at_neg_price_pct:0};
             const daysInMonth = new Date(Number(year), Number(month), 0).getDate();
             const byDay = {};
             dd.forEach(x=> { byDay[x.day]=x; });
