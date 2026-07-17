@@ -365,8 +365,8 @@ function toSqlTs(date) {
 }
 
 /* ---------- daily ENTSO-E update (Hostinger Node apps have no hPanel cron) ---------- */
-# Primary fire at 06:00 Europe/Berlin. Catch-up every 30 min after 06:00 until
-# daily.sh writes logs/daily_ok_YYYYMMDD (survives process restarts / missed ticks).
+// Primary fire at 06:00 Europe/Berlin. Catch-up every 30 min after 06:00 until
+// daily.sh writes logs/daily_ok_YYYYMMDD (survives process restarts / missed ticks).
 const DAILY_CRON_EXPR = process.env.DAILY_CRON_EXPR || "0 6 * * *";
 const DAILY_CATCHUP_EXPR = process.env.DAILY_CATCHUP_EXPR || "*/30 6-23 * * *";
 const DAILY_CRON_TZ = process.env.DAILY_CRON_TZ || "Europe/Berlin";
