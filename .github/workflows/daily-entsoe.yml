@@ -1,14 +1,16 @@
 name: Daily ENTSO-E update
 
-# Manual backup trigger only. The primary schedule runs inside the Hostinger
-# Node app (server.js + node-cron at 06:00 Europe/Berlin → ~/enerlyzer-etl/daily.sh).
-# GitHub Actions cron is unreliable (often 1–3h late) and this Node hosting plan
-# has no hPanel Cron Jobs UI — so the in-app scheduler is the source of truth.
+# Backup trigger only. Primary schedule runs inside the Hostinger Node app:
+#   - 06:00 Europe/Berlin via node-cron
+#   - catch-up every 30 min until logs/daily_ok_YYYYMMDD exists
+# This workflow is a safety net (GitHub cron is often late). daily.sh is
+# idempotent (flock + OK marker) so overlapping runs are harmless.
 #
-# The SSH key remains restricted to daily.sh via Forced Command on the server.
-# Secrets stay private; this workflow never runs from fork PRs.
+# SSH key is Forced-Command restricted to daily.sh on the server.
 
 on:
+  schedule:
+    - cron: "30 8 * * *" # ~10:30 CEST — backup if Node catch-up failed
   workflow_dispatch: {}
 
 concurrency:

@@ -364,18 +364,43 @@ function toSqlTs(date) {
   );
 }
 
-/* ---------- daily ENTSO-E update (Hostinger has no hPanel cron for Node apps) ---------- */
-const DAILY_CRON_EXPR = process.env.DAILY_CRON_EXPR || "0 6 * * *"; // 06:00 Europe/Berlin
+/* ---------- daily ENTSO-E update (Hostinger Node apps have no hPanel cron) ---------- */
+# Primary fire at 06:00 Europe/Berlin. Catch-up every 30 min after 06:00 until
+# daily.sh writes logs/daily_ok_YYYYMMDD (survives process restarts / missed ticks).
+const DAILY_CRON_EXPR = process.env.DAILY_CRON_EXPR || "0 6 * * *";
+const DAILY_CATCHUP_EXPR = process.env.DAILY_CATCHUP_EXPR || "*/30 6-23 * * *";
 const DAILY_CRON_TZ = process.env.DAILY_CRON_TZ || "Europe/Berlin";
 let dailyCronStatus = {
   enabled: false,
   expr: DAILY_CRON_EXPR,
+  catchupExpr: DAILY_CATCHUP_EXPR,
   tz: DAILY_CRON_TZ,
   script: null,
   lastTriggerAt: null,
+  lastTriggerReason: null,
   lastError: null,
-  running: false,
+  lastOkDay: null,
 };
+
+function berlinParts(d = new Date()) {
+  const parts = Object.fromEntries(
+    new Intl.DateTimeFormat("en-GB", {
+      timeZone: DAILY_CRON_TZ,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      hour12: false,
+    })
+      .formatToParts(d)
+      .filter((p) => p.type !== "literal")
+      .map((p) => [p.type, p.value])
+  );
+  return {
+    day: `${parts.year}${parts.month}${parts.day}`,
+    hour: Number(parts.hour === "24" ? "0" : parts.hour),
+  };
+}
 
 function resolveDailyScript() {
   const override = process.env.DAILY_SCRIPT_PATH;
@@ -387,11 +412,21 @@ function resolveDailyScript() {
   return null;
 }
 
-function triggerDailyUpdate(reason) {
-  if (dailyCronStatus.running) {
-    console.warn(`[enerlyzer] daily update skipped (${reason}): already running`);
-    return false;
+function dailyOkPath(script, day) {
+  return path.join(path.dirname(script), "logs", `daily_ok_${day}`);
+}
+
+function todayAlreadyOk(script) {
+  const { day } = berlinParts();
+  const ok = dailyOkPath(script, day);
+  if (fs.existsSync(ok)) {
+    dailyCronStatus.lastOkDay = day;
+    return true;
   }
+  return false;
+}
+
+function triggerDailyUpdate(reason) {
   const script = resolveDailyScript();
   dailyCronStatus.script = script;
   if (!script) {
@@ -399,57 +434,49 @@ function triggerDailyUpdate(reason) {
     console.error("[enerlyzer] daily update: daily.sh not found in", etlDirCandidates());
     return false;
   }
-  const lockPath = path.join(path.dirname(script), "logs", "daily.lock");
-  try {
-    fs.mkdirSync(path.dirname(lockPath), { recursive: true });
-    if (fs.existsSync(lockPath)) {
-      const ageMs = Date.now() - fs.statSync(lockPath).mtimeMs;
-      // Stale lock after 2h (previous crash)
-      if (ageMs < 2 * 60 * 60 * 1000) {
-        console.warn(`[enerlyzer] daily update skipped (${reason}): lock present`);
-        return false;
-      }
-      fs.unlinkSync(lockPath);
-    }
-    fs.writeFileSync(lockPath, `${process.pid} ${new Date().toISOString()} ${reason}\n`);
-  } catch (e) {
-    dailyCronStatus.lastError = String(e.message || e);
-    console.error("[enerlyzer] daily lock failed:", e.message);
+  if (todayAlreadyOk(script)) {
+    console.log(`[enerlyzer] daily update skipped (${reason}): already OK for ${berlinParts().day}`);
     return false;
   }
 
-  dailyCronStatus.running = true;
   dailyCronStatus.lastTriggerAt = new Date().toISOString();
+  dailyCronStatus.lastTriggerReason = reason;
   dailyCronStatus.lastError = null;
   console.log(`[enerlyzer] daily update starting (${reason}): ${script}`);
 
-  const child = spawn("/bin/bash", [script], {
+  // setsid: child survives frequent Hostinger lsnode recycles during long imports.
+  const child = spawn("/usr/bin/setsid", ["/bin/bash", script], {
     cwd: path.dirname(script),
     detached: true,
     stdio: "ignore",
-    env: process.env,
+    env: { ...process.env, TZ: DAILY_CRON_TZ },
   });
   child.unref();
   child.on("error", (err) => {
-    dailyCronStatus.running = false;
-    dailyCronStatus.lastError = String(err.message || err);
-    try { fs.unlinkSync(lockPath); } catch (_) {}
-    console.error("[enerlyzer] daily update spawn failed:", err.message);
-  });
-  // Parent only starts the job; daily.sh manages its own log. Clear "running"
-  // after a short grace so a second trigger the same minute is blocked, then
-  // rely on the lock file for longer overlap protection.
-  setTimeout(() => {
-    dailyCronStatus.running = false;
-  }, 60_000);
-  // Best-effort: remove lock when the detached process exits (may not fire if
-  // process group fully detaches — daily.sh also overwrites logs each day).
-  child.on("exit", (code) => {
-    dailyCronStatus.running = false;
-    try { fs.unlinkSync(lockPath); } catch (_) {}
-    console.log(`[enerlyzer] daily update child exited code=${code}`);
+    // Fallback without setsid (unlikely missing on Hostinger)
+    console.warn("[enerlyzer] setsid spawn failed, retrying with bash:", err.message);
+    const fallback = spawn("/bin/bash", [script], {
+      cwd: path.dirname(script),
+      detached: true,
+      stdio: "ignore",
+      env: { ...process.env, TZ: DAILY_CRON_TZ },
+    });
+    fallback.unref();
+    fallback.on("error", (e2) => {
+      dailyCronStatus.lastError = String(e2.message || e2);
+      console.error("[enerlyzer] daily update spawn failed:", e2.message);
+    });
   });
   return true;
+}
+
+function maybeCatchUp(reason) {
+  const script = resolveDailyScript();
+  if (!script) return false;
+  const { hour } = berlinParts();
+  if (hour < 6) return false;
+  if (todayAlreadyOk(script)) return false;
+  return triggerDailyUpdate(reason);
 }
 
 function startDailyCron() {
@@ -457,30 +484,44 @@ function startDailyCron() {
     console.log("[enerlyzer] daily cron disabled via DAILY_CRON_DISABLE");
     return;
   }
-  if (!cron.validate(DAILY_CRON_EXPR)) {
-    console.error(`[enerlyzer] invalid DAILY_CRON_EXPR: ${DAILY_CRON_EXPR}`);
+  if (!cron.validate(DAILY_CRON_EXPR) || !cron.validate(DAILY_CATCHUP_EXPR)) {
+    console.error("[enerlyzer] invalid DAILY_CRON_EXPR / DAILY_CATCHUP_EXPR");
     return;
   }
   const script = resolveDailyScript();
   dailyCronStatus.script = script;
   dailyCronStatus.enabled = true;
-  cron.schedule(
-    DAILY_CRON_EXPR,
-    () => {
-      triggerDailyUpdate("cron");
-    },
-    { timezone: DAILY_CRON_TZ }
-  );
+
+  cron.schedule(DAILY_CRON_EXPR, () => triggerDailyUpdate("cron-0600"), {
+    timezone: DAILY_CRON_TZ,
+  });
+  cron.schedule(DAILY_CATCHUP_EXPR, () => maybeCatchUp("catchup"), {
+    timezone: DAILY_CRON_TZ,
+  });
+
   console.log(
-    `[enerlyzer] daily cron scheduled: "${DAILY_CRON_EXPR}" tz=${DAILY_CRON_TZ}` +
+    `[enerlyzer] daily cron: "${DAILY_CRON_EXPR}" + catch-up "${DAILY_CATCHUP_EXPR}" tz=${DAILY_CRON_TZ}` +
       (script ? ` script=${script}` : " (WARNING: daily.sh not found yet)")
   );
+
+  // If we boot after 06:00 and today's run is missing, start immediately.
+  setTimeout(() => maybeCatchUp("startup"), 5_000);
 }
 
 app.get("/api/cron/status", (_req, res) => {
+  const script = resolveDailyScript();
+  const { day, hour } = berlinParts();
+  const okPath = script ? dailyOkPath(script, day) : null;
+  const ok = Boolean(okPath && fs.existsSync(okPath));
+  if (ok) dailyCronStatus.lastOkDay = day;
   res.json({
     ...dailyCronStatus,
-    scriptExists: Boolean(dailyCronStatus.script && fs.existsSync(dailyCronStatus.script)),
+    script,
+    scriptExists: Boolean(script && fs.existsSync(script)),
+    berlinDay: day,
+    berlinHour: hour,
+    todayOk: ok,
+    todayOkPath: okPath,
   });
 });
 
